@@ -1,0 +1,1152 @@
+# 标定工具开发日志
+
+## 2026-07-01
+
+### 已完成
+- 初始化第一阶段工程骨架，建立 `backend/`、`frontend/`、`data/` 目录。
+- 实现 FastAPI 后端骨架与本地接口：
+  - `POST /api/auth/token`
+  - `POST /api/device/online`
+  - `POST /api/stream/flv`
+  - `POST /api/stream/hls`
+  - `POST /api/stream/preferred`
+  - `POST /api/ptz/move`
+  - `POST /api/preset/query`
+  - `POST /api/preset/save`
+  - `POST /api/preset/turn`
+  - `POST /api/calibration/save`
+  - `GET /api/calibration/get`
+  - `GET /api/calibration/list`
+- 复用 `API-SDK-SignPythonDemo/request_sign_utils.py`，实现 Dahua OpenAPI 签名适配层与 token 缓存。
+- 增加 API 调用日志留痕到 `backend/app/logs/api.log`，默认脱敏 token/secret。
+- 实现本地标定配置保存与冻结帧 PNG 存储，落盘到 `data/calibrations/` 和 `data/snapshots/`。
+- 实现前端单页标定工具：
+  - 设备连接与在线检查
+  - FLV/HLS 预览流接入
+  - PTZ 微调
+  - 预置点查询、保存、跳转
+  - 冻结当前帧
+  - ROI 框选
+  - 标定配置保存
+
+### 本轮修复
+- 按 `docs/calibration-tool-fix-plan.md` 修正 PTZ 协议：
+  - endpoint 改为 `/api-aiot/device/controlMovePTZ`
+  - 请求体字段改为 `operation`、`duration`、`horizontalSpeed`、`verticalSpeed`
+  - 保留可调整的 `action -> operation` 映射表，便于继续真机联调收敛
+- 修正预置点协议：
+  - 厂商请求字段改为 `index` / `name`
+  - 前后端内部命名统一改为 `presetIndex` / `presetName`
+  - 查询结果优先解析 `index` / `name`，兼容旧字段
+- 修正标定配置结构：
+  - 标定配置保存、读取、列表接口统一改为 `presetIndex`
+  - 增加对旧配置文件中 `presetId` 的兼容读取
+- 修复前端保存校验：
+  - 保存前必须具备 `deviceId`、`channelId`、`presetIndex`、`presetName`、`targetId`、`targetName`、`roi`、`snapshotBase64`
+  - 校验错误在页面内可见
+- 增加页面操作日志区：
+  - 新增页面操作日志
+  - 新增后端只读调试接口 `GET /api/debug/recent-logs`
+- 优化页面结构与文案：
+  - 调整为 5 步流程
+  - 更新按钮文案，更贴近真实联调流程
+- 修复截图落盘路径与静态挂载根不一致问题：
+  - `snapshotPath` 改为相对 `data_root` 保存，例如 `snapshots/xxx.png`
+  - `snapshotUrl` 统一生成 `/artifacts/snapshots/xxx.png`
+  - 兼容读取旧记录中的 `data/snapshots/xxx.png`
+  - `calibration/list` 不再依赖 `relative_to(workspace_root)`，`data_root` 指到项目外也不会因路径转换抛 500
+- 修复 token 过期时间时区陷阱：
+  - ISO 字符串过期时间统一归一化为 UTC aware datetime
+  - 时间戳过期时间也统一按 UTC 解析
+  - 避免 `aware < naive` 导致第二次请求时随机炸 `TypeError`
+- 收敛 PTZ 验收表达方式：
+  - `action -> operation` 映射支持从 `backend/local_config.json` 覆盖
+  - 已将 `ptz_verified_actions` 收紧为 `ptz_verified_map`
+  - `ptz_verified_map` 记录的是“动作 -> 已真机确认 operation 码”
+  - `/api/ptz/move` 只有在“当前实际发送 operation == 已验证 operation”时才返回 `operationVerified=true`
+  - 页面日志会显示本次 PTZ 使用的 `operation` 码、已验证 operation 和 verified/unverified 状态
+- 低延迟体验优化：
+  - `useStreamPlayer.ts` 为 `flv.js` 增加低延迟 live 配置，关闭 stash buffer，缩短 source buffer 回看清理窗口
+  - `video` 增加 `preload="auto"`
+  - 播放器事件 `loadedmetadata` / `canplay` / `error` 会写入页面日志
+  - 页面新增“命令已发送 -> 等待画面稳定中 -> 可抓图”交互，稳定等待时间复用 `ptzSettleMs`
+  - `Freeze Current Frame` 在稳定等待结束前不可点击
+  - 抓图日志新增 `freeze requested at ...` / `frame captured at ...`
+- 修复播放器被日志回调抖动重建的问题：
+  - `useStreamPlayer.ts` 改为用 ref 持有最新 `onPlayerEvent` / `onPlaybackStateChange`
+  - 播放器初始化 `useEffect` 依赖收窄为 `streamType` / `streamUrl` / `videoRef`
+  - 页面传给 `StreamPreview` 的日志回调改为稳定引用，避免“写日志 -> 重渲染 -> 销毁重建播放器”
+- 修复“首帧加载后画面不动”风险：
+  - 播放状态判定从 `canplay` 收紧为 `playing`
+  - 新增 `waiting` / `stalled` / `pause` / `play failed` 日志，方便区分“没播起来”和“播起来后卡住”
+  - FLV 配置从极限低延迟档回调到更稳的折中档，恢复 stash buffer 与 audio timestamp gap 修复
+  - `video` 元素显式增加 `autoPlay`
+- 修复 live 预览掉到 `waiting` 后不会自恢复的问题：
+  - `waiting` / `stalled` 时先尝试跳到最新 `live edge`
+  - 随后自动补一次 `play()`
+  - 1.2 秒内仍未恢复时，执行 FLV/HLS 软重载
+  - 新增日志 `Preview auto recover: seek to live edge` / `Preview auto recover: player reload`
+  - 去掉 live 预览原生进度条，新增 `Reconnect Preview` 按钮做手动兜底
+- 修复“固定时间到就可抓图”的门控漏洞：
+  - 标定参数新增 `ptzExtraSettleMs`、`presetTurnSettleMs`、`streamCatchupMs`
+  - 标定参数新增 `visualStableWindowMs`、`visualStableSampleMs`、`visualStableThreshold`
+  - `CalibrationPage.tsx` 改为 5 阶段状态机：`commandAccepted` -> `mechanicalSettling` -> `streamCatchingUp` -> `visualStabilizing` -> `readyForCapture`
+  - PTZ move 使用 `command.duration + ptzExtraSettleMs + streamCatchupMs` 再进入视觉判稳
+  - preset turn 使用 `presetTurnSettleMs + streamCatchupMs` 再进入视觉判稳
+  - 新增 `useVisualStability.ts`，低分辨率采样视频帧并输出 `motionScore`
+  - 只有播放器 `playing/ready` 且视觉稳定通过后才打开抓图门控
+  - 新稳定参数已保存进 calibration JSON，旧 JSON 读取时自动补默认值
+- 判稳降敏修复：
+  - 当时曾新增 `stabilityRoi`
+  - 标定参数新增 `visualStableGraceThreshold`、`streamUnreadyDebounceMs`
+  - 当时曾将视觉判稳改为只在 `stabilityRoi` 内计算，优先对固定背景做镜头稳定判断
+  - 帧差前加入轻微模糊与像素死区，抑制压缩噪声、风吹微振和曝光抖动
+  - 同时保留 `rawMotionScore` 与 `smoothedMotionScore`，门控只用平滑分数
+  - 判稳通过逻辑改为窗口式迟滞：最近一段采样里大多数达标且无明显失败才放行
+  - 新增 grace band：轻微超阈值时不加分但也不直接失败
+  - 播放器离开 `ready` 后先进入 debounce，短暂抖动恢复不会整段回退
+  - 只有 debounce 超时或 player reload 后，才真正回退到 `streamCatchingUp`
+
+### 当前问题
+- PTZ `operation` 完整编码表仍未全部真机确认。
+  - 当前已从后端日志观察到 `left -> operation=3` 请求返回厂商 `code=200`
+  - 其余方向/缩放仍需继续联调后写入 `ptz_verified_map`
+- FLV/HLS 播放兼容性仍需浏览器与设备联调确认。
+- 云端 FLV 网页回显仍不是“绝对实时”，本轮目标是减少误判和拖尾，不追求零延迟。
+- 第二阶段识别暂未接入新的稳定门控主链路，本轮优先完成抓图放行准确性。
+- ROI 组件当前支持新建框选，未做已有 ROI 的拖拽编辑。
+
+### 验证
+- 后端 `backend/app` 已用 bundled Python 跑过 `compileall`。
+- 前端已用本地 `tsc --noEmit` 完成类型检查。
+
+### 下一步
+- 用真实设备验证 PTZ 各方向与缩放 `operation` 编码。
+- 验证 `configPreset` / `turnPreset` 的 `index` 请求体是否与设备完全一致。
+- 如厂商 PTZ 编码与当前映射不同，直接修改 `backend/app/services/dahua_ptz_service.py` 中映射表。
+- 优先验收“抓图放行是否准确”，通过后再开始第二阶段识别主链路。
+## 2026-07-02 supplemental fix
+
+- Rebuilt `frontend/src/pages/CalibrationPage.tsx` to remove corrupted status-copy text and keep the five-stage capture gate readable in the UI.
+- Fixed `Preview auto recover: player reload` handling so the page now restarts `streamCatchingUp` instead of only flipping the phase label.
+- Fixed the `streamCatchingUp` timer to read the latest playback state from a ref, preventing a stale-closure hang when playback became ready before the catch-up timer expired.
+- Restored the intended low-latency FLV config in `useStreamPlayer.ts`:
+  - `enableStashBuffer: false`
+  - `stashInitialSize: 32`
+  - `fixAudioTimestampGap: false`
+- Added backend schema validation so `visualStableGraceThreshold` cannot be smaller than `visualStableThreshold` even if the request bypasses the frontend form.
+## 2026-07-04 phase-2 step 1
+
+- Started phase-2 implementation with the first ordered milestone only:
+  - configuration consumption
+  - single-point recognition entry
+- Added root package `inspector/` with a runnable command entry:
+  - `python -m inspector.run_once --config data/calibrations/<file>.json --preset <index>`
+- Added phase-2 global config consumer in `inspector/config.py`:
+  - reads `recognition_v1` from `backend/local_config.json`
+  - falls back to defaults for sample duration, fps, frame count, feature weights, thresholds, replay-save policy, and algorithm version
+- Added standardized phase-2 result schema in `inspector/models.py`:
+  - `executionResult`
+  - `visualState`
+  - `scoreSummary`
+  - `evidencePaths`
+  - `timing`
+  - `algorithmVersion`
+  - plus `configPath`, `target`, `message` for easier step-1 troubleshooting
+- Extended `CalibrationStorageService` with `load_path(...)` so phase-2 can reuse and normalize existing phase-1 calibration JSON directly.
+- Implemented `inspector/run_once_service.py`:
+  - load calibration JSON
+  - validate requested preset against `presetIndex` in the calibration file
+  - preflight Dahua config
+  - turn preset through existing `preset_service`
+  - return structured execution result
+- Added `recognition_v1` example block into `backend/local_config.example.json`.
+- Added lazy import for Dahua preset runtime dependencies so step-1 config validation can still run before network/runtime dependencies are fully prepared.
+- Local validation:
+  - `python -m inspector.run_once --config data/calibrations/AB00A7DPAJ00124_1.json --preset 999`
+    - returns structured `detect_error` without touching vendor APIs
+  - bundled Python `compileall inspector backend/app` passed
+## 2026-07-04 phase-2 step 2
+
+- Continued phase-2 into the second ordered milestone: remote FLV sampling + async replay persistence.
+- Added `inspector/flv_sampler.py`:
+  - reuses existing Dahua FLV stream lookup
+  - opens FLV with OpenCV `VideoCapture`
+  - samples a fixed-spec short sequence using global `sampleDurationMs` / `sampleFps` / `sequenceFrameCount`
+  - distinguishes `stream_failed` vs `insufficient_frames`
+- Added `inspector/replay_store.py`:
+  - saves replay materials as `sequence.npz` + `metadata.json`
+  - returns planned evidence paths immediately
+  - async save failure only writes logs and does not block or fail the online result
+- Updated `inspector/run_once_service.py` main chain to:
+  - `turnPreset`
+  - wait `presetTurnSettleMs + streamCatchupMs`
+  - fetch FLV and sample a fixed-spec short sequence
+  - return `executionResult=success` with sampling summary
+  - schedule replay persistence in background
+- Extended result fields for step-2 acceptance:
+  - `timing.settleWaitMs`
+  - `scoreSummary.sampledFrameCount`
+  - `scoreSummary.targetFrameCount`
+  - `scoreSummary.configuredSampleFps`
+  - `scoreSummary.actualSampleFps`
+  - `scoreSummary.configuredSampleDurationMs`
+  - `scoreSummary.actualSampleDurationMs`
+  - `scoreSummary.streamType`
+  - `evidencePaths.replaySequencePath`
+  - `evidencePaths.replayMetadataPath`
+- Added config guard in `RecognitionGlobalConfig` so `sampleDurationMs * sampleFps` stays aligned with `sequenceFrameCount`.
+- Updated `backend/requirements.txt` with runtime dependencies for this milestone:
+  - `numpy`
+  - `opencv-python-headless`
+- Local validation:
+  - bundled Python `compileall inspector backend/app` passed
+  - synthetic replay save test passed and produced `sequence.npz` + `metadata.json`
+  - current Codex bundled Python still lacks `requests` and `cv2`, so real FLV sampling was not executed end-to-end in this environment
+## 2026-07-04 phase-2 step 2 tail fix
+
+- Closed the last acceptance gap for phase-2 step 2:
+  - replay persistence is no longer backed by an in-process thread pool
+  - CLI now dispatches replay save to a detached child process through `inspector.replay_worker`
+- Rebuilt `inspector/replay_store.py` around process-based replay persistence:
+  - main process only writes lightweight handoff artifacts:
+    - `replay-handoff.json`
+    - temporary raw frame/timestamp files
+  - main process no longer writes a second full compressed replay `.npz` as handoff
+  - detached child process writes the final `sequence.npz` and `metadata.json`
+  - worker updates `replay-status.json` from `pending` to `ready` or `failed`
+- Added explicit replay save state to the standard result model:
+  - `replaySave.status`
+  - `replaySave.statusPath`
+  - `replaySave.message`
+- Clarified path semantics:
+  - `evidencePaths.replaySequencePath` and `replayMetadataPath` are now paired with `replaySave.status`
+  - callers must treat these paths as preallocated while status is `pending`
+- Added worker-side failure handling:
+  - if detached replay save crashes, `replay-status.json` is switched to `failed`
+  - payload cleanup still runs in `finally`
+- Tight local feedback loop used for verification:
+  - with replay save disabled, dispatch returned in about `0.01 ms`
+  - with replay save enabled, dispatch returned in about `18.82 ms`
+  - delta stayed around `18.81 ms` for a synthetic 20-frame 640x480 sequence
+  - status file started as `pending`
+  - status file transitioned to `ready`
+  - `sequence.npz` and `metadata.json` both appeared after return
+## 2026-07-04 phase-2 step 3
+
+- Entered the third ordered milestone: full-frame alignment + three-feature weighted frame scoring.
+- Added `inspector/frame_alignment.py`:
+  - aligns each frame to the first frame
+  - outputs aligned frame sequence
+  - outputs per-frame global shift summary
+  - rejects unrealistic large "global shifts" so local splash motion is not misclassified as whole-frame jitter
+- Added `inspector/frame_features.py`:
+  - extracts three frame-level ROI features
+  - `localResidualMotion`
+  - `dynamicAreaRatio`
+  - `highlightDisturbance`
+- Added `inspector/frame_scoring.py`:
+  - normalizes the three raw features using global scales
+  - combines them with fixed global weights
+  - outputs `weightedScore` and `framePass`
+- Added `inspector/debug_artifacts.py`:
+  - writes representative ROI frame as `representative-frame.ppm`
+  - writes motion diff map as `motion-debug.pgm`
+- Integrated step-3 logic into `inspector/run_once_service.py`:
+  - after FLV sampling, run alignment
+  - extract frame features
+  - compute weighted frame scores
+  - keep `visualState = null`
+  - enrich result with frame-pass count, feature summaries, alignment summaries, and debug artifact paths
+- Extended `RecognitionGlobalConfig` with step-3 parameters:
+  - alignment enable/downsample/max-shift ratio
+  - dynamic/highlight pixel thresholds
+  - per-feature normalization scales
+- Local synthetic validation:
+  - pure jitter sequence:
+    - ROI motion mean dropped from about `0.0523` to `0.0078`
+    - residual ratio about `0.149`
+  - obvious splash-like sequence:
+    - frame pass count `8/10`
+  - idle sequence:
+    - frame pass count `0/10`
+- Step-3 current boundary remains unchanged:
+  - no temporal voting yet
+  - no final `has_splash / no_splash / undetermined` output yet
+- Follow-up cleanup:
+  - bumped default `algorithmVersion` from `phase-2-v1-step1` to `phase-2-v1-step3`
+  - keeps returned results and local config example aligned with the actual implemented milestone
+## 2026-07-04 phase-2 step 3 fix-up
+
+- Tightened the alignment contract before step 4:
+  - raw estimated global shifts are now preserved even when they exceed the allowed alignment range
+  - applied alignment shifts are tracked separately from raw evidence shifts
+  - overflow frames are explicitly marked instead of being silently zeroed
+- Tightened score summary semantics:
+  - `scoreSummary.dynamicAreaRatio` now carries the raw ROI dynamic-area ratio
+  - added `scoreSummary.dynamicAreaScore` for the normalized weighted-scoring component
+- Tightened timing and evidence-write behavior:
+  - `timing.detectMs` now measures the actual detection stage
+  - representative ROI frame and motion debug image are no longer written synchronously in `run_once`
+  - those debug artifacts are now emitted by the replay persistence worker as best-effort async materials
+## 2026-07-04 phase-2 step 4
+
+- Entered the fourth ordered milestone: temporal voting + standard recognition result.
+- Added `inspector/temporal_voting.py`:
+  - resolves final `visualState` from frame-pass ratio
+  - keeps `executionResult` and `visualState` separated
+  - applies lightweight reliability gates before finalizing the vote
+- Implemented first-pass sequence vote:
+  - `passRatio >= sequenceVoteThreshold` -> `has_splash`
+  - `passRatio <= 1 - sequenceVoteThreshold` -> `no_splash`
+  - middle band -> `undetermined`
+- Implemented reliability gates as global config only:
+  - overflow-frame ratio too high -> `undetermined`
+  - global motion exceeded and post-alignment ROI motion did not improve enough -> `undetermined`
+- Extended score summary with vote-stage diagnostics:
+  - `overflowFrameRatio`
+  - `motionReductionRatio`
+  - `reliabilityGateTriggered`
+  - `temporalVoteReason`
+- Main-chain result now outputs non-null `visualState` on `executionResult = success`.
+- Frozen `effectiveRecognitionConfig` in the main detect stage and propagated it to async replay persistence:
+  - replay handoff now carries the effective config snapshot
+  - replay run directory now writes `recognition-config.snapshot.json`
+  - replay worker no longer depends on reloading the current mutable local config to generate async evidence
+- Added config snapshot metadata:
+  - `metadata.json` now records `algorithmVersion`
+  - `metadata.json` now records an effective-config summary and snapshot path
+## 2026-07-05 phase-1 stability-roi removal
+
+- Realigned phase-1 calibration with the current project goal:
+  - removed the separate `stabilityRoi` calibration field from frontend draft, save validation, and save summary
+  - removed the second ROI canvas used only for stability ROI marking
+- Kept the visual-stability gate itself:
+  - `visualStableWindowMs`
+  - `visualStableSampleMs`
+  - `visualStableThreshold`
+  - `visualStableGraceThreshold`
+  - `streamUnreadyDebounceMs`
+- Visual stability now always evaluates the full preview frame:
+  - no separate stability ROI input
+  - status/log wording now reflects full-frame sampling
+- Backend schema/storage updated:
+  - new saves no longer require or write `stabilityRoi`
+  - old calibration JSON files may still contain `stabilityRoi`
+  - old field is now ignored on read and never written back into new records
+## 2026-07-05 phase-2 frame gate retune
+
+- Retuned phase-2 frame-level recognition to target a central continuous white splash mass instead of generic "bright + moving" evidence.
+- Rebuilt `inspector/frame_features.py`:
+  - kept `localResidualMotion`, `dynamicAreaRatio`, and `highlightDisturbance`
+  - added connected-component analysis on the ROI bright mask
+  - added `largestBrightComponentRatio`
+  - added `brightComponentCount`
+  - added `fragmentationScore`
+  - added `centerBrightCoverage`
+  - added `upperHalfBrightRatio` / `lowerHalfBrightRatio`
+  - added `verticalSpreadRatio`
+  - tightened `highlightDisturbance` so it now measures disturbance inside the main bright component instead of across the full ROI
+- Rebuilt `inspector/frame_scoring.py`:
+  - added a hard gate that requires a sufficiently large, central, vertically spread, continuous bright component before a frame can pass
+  - reduced `localResidualMotion` / `dynamicAreaRatio` weights
+  - raised continuous-bright-mass features to the primary evidence path
+  - kept weighted scoring only after the hard gate passes
+- Extended step-4 inputs without changing the step-4 vote structure:
+  - `TemporalVoteResolver` still consumes frame-pass ratios
+  - frame-pass ratios now come from the stricter frame gate
+- Extended result/debug summary fields:
+  - `largestBrightComponentRatio`
+  - `brightComponentCount`
+  - `fragmentationScore`
+  - `centerBrightCoverage`
+  - `upperHalfBrightRatio`
+  - `lowerHalfBrightRatio`
+  - `verticalSpreadRatio`
+  - `hardGatePassed`
+  - `hardGatePassRatio`
+  - `hardGatePassCount`
+- Updated `backend/local_config.example.json` with the new hard-gate thresholds, connected-bright-mass scales, and rebalanced default weights.
+## 2026-07-05 phase-2 frame gate follow-up fix
+
+- Closed three post-review gaps in the new frame gate:
+  - static large bright regions must no longer pass without motion evidence
+  - sequence-level hard-gate reporting must not be confused with "at least one frame passed"
+  - hard-gate thresholds must no longer be artificially tied to scoring normalization scales
+- Added dynamic minimums to the hard gate in `inspector/config.py`:
+  - `hardGateMinLocalMotion`
+  - `hardGateMinDynamicAreaRatio`
+  - `hardGateMinHighlightMotion`
+- Updated `inspector/frame_scoring.py` so the frame hard gate now requires:
+  - structural bright-mass constraints
+  - plus at least one dynamic evidence branch above the configured minimum
+- Clarified hard-gate summary semantics in `inspector/models.py` / `inspector/run_once_service.py`:
+  - `anyHardGatePassed` = whether any frame passed the hard gate
+  - `hardGatePassed` = whether sequence hard-gate pass ratio reaches the sequence threshold
+  - `hardGatePassRatio` / `hardGatePassCount` remain the main quantitative replay diagnostics
+- Removed the invalid config coupling that required hard-gate thresholds to stay below scoring feature scales.
+## 2026-07-05 daytime baseline frozen
+
+- Added [docs/daytime-recognition-baseline.md](C:/Users/Maple_Rain/Documents/Items/splash_water/docs/daytime-recognition-baseline.md) to freeze the current phase-2 daytime line before moving to night IR work.
+- Recorded the latest small-sample daytime acceptance set:
+  - `run_once_result_has`: `10 / 10 has_splash`
+  - `run_once_result_no`: `10 / 10 no_splash`
+- Captured the current interpretation explicitly:
+  - daytime success now depends on central continuous bright-mass evidence plus at least one dynamic branch
+  - negative daytime samples may still show motion-like metrics, but are rejected because they do not form a splash-shaped white body
+- Marked difficult daytime conditions as deferred regression topics rather than current blockers:
+  - midday strong reflection
+  - high wind
+  - chaotic ripple
+  - special weather
+## 2026-07-05 night ir recognition v1 design
+
+- Added [docs/night-ir-recognition-v1-design.md](C:/Users/Maple_Rain/Documents/Items/splash_water/docs/night-ir-recognition-v1-design.md) as the first dedicated design document for the night infrared recognition line.
+- Recorded the key night observation:
+  - no-splash IR frames show bright narrow blade-like bars
+  - has-splash IR frames show one dominant diffuse central bright mass
+  - pure white-highlight logic is unsafe at night because blades are also bright in IR
+- Locked the current design direction:
+  - keep the existing preset + ROI + short-sequence + alignment + frame-gate + temporal-vote runtime chain
+  - split day and night by global scene-level config, not by per-preset tuning
+  - promote shape and temporal dominant-body disturbance over raw brightness
+- Proposed night-oriented feature emphasis:
+  - strengthen dominant bright-mass geometry
+  - add `gapFillRatio`
+  - add temporal dominant-body variance features
+  - keep dynamic evidence as a required branch
+## 2026-07-05 night ir implementation checklist
+
+- Added [docs/night-ir-implementation-checklist.md](C:/Users/Maple_Rain/Documents/Items/splash_water/docs/night-ir-implementation-checklist.md) to translate the night IR design into an execution checklist for the next implementation round.
+- Broke the work into 6 ordered steps:
+  - add mode split
+  - freeze daytime path
+  - add IR-specific features
+  - rebuild IR hard gate
+  - keep temporal vote structure and extend diagnostics
+  - run a small clear night acceptance set
+- Explicitly marked current non-goals:
+  - no model
+  - no per-preset tuning
+  - no hard-night edge-case sweep in the first round
+  - no daytime baseline regression
+## 2026-07-06 night ir first real-sample failure analysis
+
+- Confirmed the current night failure is not a scene-mode routing problem:
+  - `recognition_v1.sceneMode = night_ir` is active
+  - result JSONs report `sceneMode = night_ir`
+  - replay `recognition-config.snapshot.json` also freezes the night override profile
+- Confirmed the current failure happens before temporal vote:
+  - both `night_has` and `night_no` samples collapse to `largestBrightComponentRatio = 0`
+  - `centerBrightCoverage = 0`
+  - `verticalSpreadRatio = 0`
+  - `gapFillRatio = 0`
+  - `temporalAreaVariance = 0`
+  - `temporalShapeVariance = 0`
+- Identified the concrete mismatch:
+  - current night config uses `highlightPixelThreshold = 215`
+  - real ROI gray values in night samples are far lower, with high-percentile values only around the low `120s`
+  - current night extractor therefore misses the true splash body entirely
+- Added [docs/night-ir-fix-checklist.md](C:/Users/Maple_Rain/Documents/Items/splash_water/docs/night-ir-fix-checklist.md) to drive the next repair round:
+  - replace absolute night thresholding with ROI-relative extraction
+  - restore non-zero structural and temporal night features first
+  - only retune hard gates after extraction is working
+## 2026-07-06 night ir second-round tuning direction
+
+- Added [docs/night-ir-second-round-tuning-checklist.md](C:/Users/Maple_Rain/Documents/Items/splash_water/docs/night-ir-second-round-tuning-checklist.md) to summarize the current tuning conclusion after expanding real night positive samples.
+- Locked the current interpretation:
+  - night IR is now structurally separable
+  - current main problem is recall, not false positives
+  - structure still dominates night discrimination more than temporal features
+- Identified the most evidence-backed next tuning point:
+  - `hardGateMinGapFillRatio`
+- Explicitly deferred lower-priority changes:
+  - do not start with vote-threshold tuning
+  - do not start with temporal-feature weight tuning
+  - do not change multiple night parameters at once
+## 2026-07-06 night ir third-round tuning direction
+
+- Added [docs/night-ir-third-round-tuning-checklist.md](C:/Users/Maple_Rain/Documents/Items/splash_water/docs/night-ir-third-round-tuning-checklist.md) after expanding to 20 real night positive samples.
+- Updated the main night tuning conclusion:
+  - current night line is generally usable
+  - false positives remain controlled
+  - the new main problem is still positive recall
+- Shifted the next primary tuning target:
+  - from `hardGateMinGapFillRatio`
+  - to `hardGateMinCenterBrightCoverage`
+- Recorded the new rationale:
+  - several failed night positives now cluster around the current center-coverage gate
+  - `gapFillRatio` is no longer the strongest shared blocker among the remaining misses
+
+## 2026-07-06 night ir second-round gap-fill tuning
+
+- Executed the second-round tuning checklist with the required one-parameter-at-a-time loop.
+- This round only tuned `recognition_v1.nightIr.hardGateMinGapFillRatio`.
+- Offline replay trial results on the current `15` real night positive + `5` real night negative set:
+  - `gapFill = 0.90`
+    - positive: `10 has_splash / 2 undetermined / 3 no_splash`
+    - negative: `5 / 5 no_splash`
+  - `gapFill = 0.88`
+    - positive: `11 has_splash / 3 undetermined / 1 no_splash`
+    - negative: `5 / 5 no_splash`
+  - `gapFill = 0.86`
+    - positive: `12 has_splash / 2 undetermined / 1 no_splash`
+    - negative: `5 / 5 no_splash`
+- Chosen result:
+  - locked `hardGateMinGapFillRatio = 0.86` into:
+    - `backend/local_config.json`
+    - `backend/local_config.example.json`
+- Direct sample recovery impact:
+  - the two previously most typical gap-fill-blocked positive samples were recovered from:
+    - `no_splash / hardGatePassRatio = 0`
+  - to:
+    - one `has_splash`
+    - one `has_splash` / `undetermined` boundary depending on tested gap threshold
+- Current interpretation after the second round:
+  - `gapFillRatio` was indeed the highest-value structural gate to relax first
+  - the remaining single positive `no_splash` sample is no longer a pure gap-fill failure
+  - one remaining `undetermined` positive sample is already close to the vote boundary and should not trigger immediate vote-threshold tuning yet
+- Validation:
+  - bundled Python replay rerun completed successfully
+  - negative night set stayed `5 / 5 no_splash`
+
+## 2026-07-06 night ir third-round center-coverage tuning
+
+- Executed the third-round tuning checklist with the same one-parameter-at-a-time rule.
+- This round only tuned `recognition_v1.nightIr.hardGateMinCenterBrightCoverage`.
+- Trialed the recommended center-coverage sequence:
+  - `0.48`
+  - `0.46`
+  - `0.44`
+- Replay trial conclusion on the currently available boundary-heavy night candidate set plus the fixed `5` negative clips:
+  - `0.48`
+    - positive candidates: `10 has_splash / 15 no_splash`
+    - negatives: `5 / 5 no_splash`
+    - the representative borderline sample at center coverage about `0.478` still stayed `no_splash`
+  - `0.46`
+    - positive candidates: `11 has_splash / 14 no_splash`
+    - negatives: `5 / 5 no_splash`
+    - the same `0.478` borderline sample was recovered to `has_splash`
+  - `0.44`
+    - positive candidates stayed the same as `0.46`
+    - negatives still stayed `5 / 5 no_splash`
+- Chosen result:
+  - locked `hardGateMinCenterBrightCoverage = 0.46` into:
+    - `backend/local_config.json`
+    - `backend/local_config.example.json`
+- Current interpretation:
+  - `centerBrightCoverage` is confirmed to be the next real night-IR bottleneck after `gapFillRatio`
+  - lowering from `0.50` to `0.46` recovers at least one representative center-borderline splash sample
+  - lowering further to `0.44` did not bring extra replay benefit in this round, so it was not adopted
+- Validation:
+  - negative reference set remained `5 / 5 no_splash`
+
+## 2026-07-06 night ir relative-threshold fix
+
+- Executed the repair round from [docs/night-ir-fix-checklist.md](C:/Users/Maple_Rain/Documents/Items/splash_water/docs/night-ir-fix-checklist.md).
+- Rebuilt the night bright-mass extraction entry in `inspector/frame_features.py`:
+  - daytime path still uses the existing absolute `highlightPixelThreshold`
+  - `night_ir` now uses a dedicated ROI-relative extraction branch
+  - the night branch applies light ROI blur before thresholding
+  - the night threshold is now derived from ROI statistics instead of assuming IR splash reaches a fixed white level
+- Added new night extraction config knobs in `inspector/config.py` and both local config files:
+  - `nightBrightQuantile`
+  - `nightBrightStdMultiplier`
+  - `nightBrightMinThreshold`
+  - `nightBrightBlurRadius`
+- Added replay/result diagnostics so the next tuning round can see whether extraction is sane:
+  - `scoreSummary.brightThresholdMean`
+  - `scoreSummary.roiBrightnessQ99Mean`
+  - `scoreSummary.roiBrightnessMaxMean`
+  - replay `metadata.json -> extra` now records the same values
+- Re-ran the current real night replay set after the extraction fix:
+  - the first 5 clips remained a low-structure cluster:
+    - `largestBrightComponentRatio` about `0.08 - 0.11`
+    - `centerBrightCoverage = 0`
+    - `verticalSpreadRatio` about `0.18 - 0.24`
+    - `gapFillRatio` about `0.84 - 0.89`
+  - the later 5 clips recovered as a high-structure cluster:
+    - `largestBrightComponentRatio` about `0.45 - 0.49`
+    - `centerBrightCoverage` about `0.79 - 0.90`
+    - `verticalSpreadRatio` about `0.73 - 0.86`
+    - `gapFillRatio` about `0.95 - 0.97`
+  - temporal features also recovered from all-zero:
+    - `temporalAreaVariance` no longer collapsed to `0`
+    - `temporalShapeVariance` no longer collapsed to `0`
+- Only after extraction recovered, retuned the night hard gate in `backend/local_config.json` / `backend/local_config.example.json`:
+  - raised structural requirements toward a large central diffuse mass
+  - lowered night dynamic minimums to match real IR replay magnitude instead of daytime-like motion assumptions
+  - intentionally did not change `framePassThreshold` or `sequenceVoteThreshold`
+- Current real-night replay result after the fix:
+  - low-structure cluster: `5 / 5 no_splash`
+  - high-structure cluster: `3 / 5 has_splash`
+  - remaining boundary clips: `1 / 5 undetermined`, `1 / 5 no_splash`
+- Validation:
+  - bundled Python `compileall inspector backend/app` passed
+  - white-box offline replay rerun confirms the night extraction layer no longer collapses to all-zero features
+  - daytime replay path remained unchanged in code and historical `has_splash` replay count stayed at `20 -> 20`
+
+## 2026-07-05 phase-2 night ir implementation
+
+- Implemented the first night-IR recognition cut from [docs/night-ir-implementation-checklist.md](C:/Users/Maple_Rain/Documents/Items/splash_water/docs/night-ir-implementation-checklist.md).
+- Added explicit scene-mode split in `inspector/`:
+  - new `sceneMode` contract: `day_visible` / `night_ir`
+  - `RecognitionGlobalConfig` now resolves top-level `recognition_v1` plus optional `dayVisible` / `nightIr` override blocks
+  - online result and replay metadata now always record the active scene mode
+- Froze the current daytime path instead of blending day/night heuristics:
+  - `WeightedFrameScorer` now branches explicitly by `sceneMode`
+  - daytime branch keeps the already accepted center-bright-mass + dynamic-evidence gate
+  - night IR branch uses its own hard gate and weights without mutating the daytime scoring path
+- Added night-IR-specific frame features in `inspector/frame_features.py`:
+  - `gapFillRatio`
+  - `temporalAreaVariance`
+  - `temporalShapeVariance`
+  - existing bright-mass geometry features continue to be reused
+- Rebuilt the night IR hard gate in `inspector/frame_scoring.py`:
+  - structure gate requires a sufficiently large, central, vertically spread, continuous bright mass
+  - `gapFillRatio` must pass so blade-like dark gaps are not treated as splash body
+  - dynamic branch now accepts any one of:
+    - `localResidualMotion`
+    - `highlightDisturbance`
+    - `temporalAreaVariance`
+    - `temporalShapeVariance`
+  - night weighted score intentionally removes `dynamicAreaWeight` from the main evidence path
+- Extended standard result / replay diagnostics:
+  - `RecognitionRunResult.sceneMode`
+  - `RecognitionScoreSummary.sceneMode`
+  - `gapFillRatio`
+  - `temporalAreaVariance`
+  - `temporalShapeVariance`
+  - replay `metadata.json -> extra` now records the same IR diagnostics for offline review
+- Updated `backend/local_config.example.json`:
+  - default `sceneMode = day_visible`
+  - added night-only override block under `recognition_v1.nightIr`
+  - bumped default algorithm identifier to `phase-2-v1-scene-mode`
+- Local validation:
+  - bundled Python `compileall inspector backend/app` passed
+  - daytime offline replay regression stayed at:
+    - `no_splash -> no_splash = 21`
+    - `has_splash -> has_splash = 20`
+    - `has_splash -> no_splash = 8`
+    - `undetermined -> no_splash = 1`
+  - three darkest real replay clips under `2026-07-05T11:46/11:47Z` all stayed `night_ir -> no_splash` with `passRatio = 0.0`
+  - synthetic `static_bars` probe stayed `no_splash`
+  - synthetic `dynamic_blob` probe reached `has_splash` with `passRatio = 0.95`
+- Current boundary after this round:
+  - daytime line remains the frozen baseline
+  - night IR negative path has initial real replay signal
+  - night IR positive acceptance still lacks a small real clear `has_splash` set, so example thresholds remain provisional
+
+## 2026-07-06 night ir baseline frozen
+
+- Frozen the current night IR baseline in [docs/night-ir-baseline.md](C:/Users/Maple_Rain/Documents/Items/splash_water/docs/night-ir-baseline.md).
+- Confirmed the latest validated manual `night_ir` sample set is now:
+  - positive: `40 / 40 has_splash`
+  - negative: `10 / 10 no_splash`
+- Recorded the key operational lesson from the latest recovery:
+  - night stability did not come only from threshold tuning
+  - ROI margin was also critical because the aerator / splash body can drift slightly at night
+  - the accepted night ROI now uses:
+    - `x = 306`
+    - `y = 296`
+    - `width = 159`
+    - `height = 99`
+- Explicitly froze the currently accepted night override block before auto scene-mode work:
+  - `hardGateMinGapFillRatio = 0.86`
+  - `hardGateMinCenterBrightCoverage = 0.46`
+  - `hardGateMinLargestBrightComponentRatio = 0.25`
+  - `hardGateMinVerticalSpreadRatio = 0.55`
+  - `hardGateMinContinuousBrightRatio = 0.6`
+- Next priority after this freeze:
+  - change from manual `sceneMode = night_ir/day_visible` switching to automatic scene recognition with manual override retained
+
+## 2026-07-07 auto scene mode switch planning
+
+- Wrote the implementation direction for automatic day/night switching in [docs/auto-scene-mode-switch-design.md](C:/Users/Maple_Rain/Documents/Items/splash_water/docs/auto-scene-mode-switch-design.md).
+- Wrote the execution checklist in [docs/auto-scene-mode-switch-checklist.md](C:/Users/Maple_Rain/Documents/Items/splash_water/docs/auto-scene-mode-switch-checklist.md).
+- Planning conclusion:
+  - do not use a single black-white check as the switch
+  - use a lightweight scene classifier before recognition
+  - classify into `day_visible / night_ir / ambiguous`
+  - keep manual override permanently
+  - use dual-path fallback for ambiguous scenes instead of hard-guessing
+- Proposed runtime contract evolution:
+  - requested mode becomes `auto | day_visible | night_ir`
+  - result and replay metadata should both expose:
+    - `requestedSceneMode`
+    - `effectiveSceneMode`
+    - `sceneModeConfidence`
+    - `sceneModeReason`
+    - whether fallback was used
+- Baseline protection rule:
+  - auto switching is not allowed to break the frozen daytime or night-IR baselines
+
+## 2026-07-07 auto scene mode switch implementation
+
+- Implemented the auto scene-mode switching runtime from:
+  - [docs/auto-scene-mode-switch-design.md](C:/Users/Maple_Rain/Documents/Items/splash_water/docs/auto-scene-mode-switch-design.md)
+  - [docs/auto-scene-mode-switch-checklist.md](C:/Users/Maple_Rain/Documents/Items/splash_water/docs/auto-scene-mode-switch-checklist.md)
+- Extended the phase-2 scene-mode contract in `inspector/models.py`:
+  - `sceneMode = auto | day_visible | night_ir`
+  - retained manual override compatibility
+  - added result diagnostics:
+    - `requestedSceneMode`
+    - `effectiveSceneMode`
+    - `sceneModeConfidence`
+    - `sceneModeReason`
+    - `sceneModeFallbackUsed`
+    - `sceneModeDiagnostics`
+    - `dayVisibleVisualState`
+    - `nightIrVisualState`
+    - `fallbackResolution`
+- Added conservative auto-scene config knobs in `inspector/config.py` and both local config files:
+  - `sceneAutoFrameCount`
+  - `sceneAutoCenterCropRatio`
+  - `sceneAutoConfidenceThreshold`
+  - `sceneAutoMinColorfulness`
+  - `sceneAutoMinSaturationP90`
+  - `sceneAutoMaxChannelDeltaForIr`
+  - `sceneAutoMinChannelCorrelationForIr`
+  - `sceneAutoUseDualPathFallback`
+- Added `inspector/scene_mode_resolver.py` as an isolated pre-recognition classifier:
+  - uses early sampled frames plus center crop
+  - computes global diagnostics:
+    - `colorfulnessMean`
+    - `saturationP90`
+    - `channelDeltaMean`
+    - `channelCorrelation`
+    - `brightnessMean`
+    - `brightnessStd`
+  - outputs:
+    - `day_visible`
+    - `night_ir`
+    - `ambiguous`
+  - carries confidence and a compact reason string
+- Integrated auto mode into `inspector/run_once_service.py`:
+  - manual `day_visible` / `night_ir` still run unchanged
+  - `auto` now resolves scene mode after FLV sampling and before the existing detection body
+  - ambiguous scenes use dual-path fallback on the same sampled sequence:
+    - run once as `day_visible`
+    - run once as `night_ir`
+    - if both agree, accept the agreed visual result
+    - if they conflict, return `visualState = undetermined`
+- Replay metadata now records the scene-mode decision summary together with the existing recognition evidence.
+- Updated local rollout default to `recognition_v1.sceneMode = auto` while keeping the frozen day/night override blocks intact.
+- Local validation:
+  - bundled Python `compileall inspector backend/app` passed
+  - synthetic resolver smoke check:
+    - clearly colored sample -> `day_visible`
+    - clearly grayscale IR-like sample -> `night_ir`
+- Remaining acceptance work:
+  - replay the frozen daytime and night-IR real baselines under `sceneMode = auto`
+  - confirm ambiguous fallback does not trigger too often on clear scenes
+
+## 2026-07-07 auto scene switch follow-up fixes
+
+- Fixed the scene-mode rollout and traceability gaps found after the first auto-switch integration review.
+- Corrected recognition version traceability:
+  - top-level shared `algorithmVersion` is now back to the daytime baseline
+  - `dayVisible.algorithmVersion` is now explicit
+  - `nightIr.algorithmVersion` is now explicit
+  - this prevents `day_visible` runs from being mislabeled as `phase-2-v1-night-relative-threshold`
+- Rolled back publish defaults until frozen real baselines are replayed:
+  - `backend/local_config.example.json -> sceneMode = day_visible`
+  - `backend/local_config.json -> sceneMode = night_ir`
+  - `auto` remains implemented but is no longer the default shipped mode before acceptance
+- Fixed `RunOnceService(global_config=...)` losing raw day/night profile blocks:
+  - constructor now accepts optional `raw_config`
+  - if only an effective `global_config` is injected, the service now prefers the original local raw config so auto fallback can still switch real day/night profile overrides
+  - only if no raw profile source exists does it synthesize a minimal fallback raw config
+- Local validation:
+  - bundled Python `compileall inspector backend/app` passed
+  - targeted config smoke check confirmed:
+    - `day_visible.algorithmVersion -> phase-2-v1-step4-center-gate`
+    - `night_ir.algorithmVersion -> phase-2-v1-night-relative-threshold`
+    - injected `RunOnceService(global_config=..., raw_config=...)` preserves profile switching
+
+## 2026-07-07 single-point recognition completion frozen
+
+- Wrote the stage completion summary in [docs/single-point-recognition-completion.md](C:/Users/Maple_Rain/Documents/Items/splash_water/docs/single-point-recognition-completion.md).
+- Current preserved single-point acceptance is now recorded as:
+  - daytime:
+    - `10 / 10 has_splash`
+    - `10 / 10 no_splash`
+    - `20 / 20` total correct
+  - night IR:
+    - `40 / 40 has_splash`
+    - `10 / 10 no_splash`
+    - `50 / 50` total correct
+- Stage conclusion:
+  - single-point daytime visible recognition is basically complete for the current phase
+  - single-point night IR recognition is basically complete for the current phase
+  - further same-condition single-point tuning is no longer the best next investment
+- Next priority is now explicitly shifted to:
+  - pseudo multi-point testing
+  - preserving the current day/night baselines as regression anchors
+
+## 2026-07-08 pseudo multi-point test design frozen
+
+- Wrote the pseudo multi-point phase design in [docs/pseudo-multi-point-test-design.md](C:/Users/Maple_Rain/Documents/Items/splash_water/docs/pseudo-multi-point-test-design.md).
+- Wrote the execution checklist in [docs/pseudo-multi-point-test-checklist.md](C:/Users/Maple_Rain/Documents/Items/splash_water/docs/pseudo-multi-point-test-checklist.md).
+- Final design decisions fixed for the first implementation:
+  - new standalone CLI entry
+  - one real recognition preset plus one transition preset
+  - transition preset does not need calibration config
+  - first round also starts from preset 2
+  - reuse `RunOnceService` directly instead of spawning repeated CLI subprocesses
+  - continue all rounds after failure, do not retry failed rounds
+  - no extra settle wait on preset 2
+  - no extra inter-round sleep
+  - do not wait for replay async save completion
+  - inherit current `sceneMode` by default, but allow optional override
+  - expected visual state becomes an explicit input parameter
+  - each run writes one dedicated output directory with summary plus per-round JSON files
+  - interrupted or aborted runs must still write partial summaries
+  - initial default scheduler-level timeouts:
+    - `transition_preset_timeout = 5s`
+    - `round_timeout = 25s`
+- First acceptance target fixed as:
+  - `10` rounds all executed
+  - `10 / 10` preset 1 results match expected visual state
+
+## 2026-07-08 pseudo multi-point test implementation
+
+- Implemented the first runnable pseudo multi-point validation CLI in [inspector/pseudo_multi_point_test.py](C:/Users/Maple_Rain/Documents/Items/splash_water/inspector/pseudo_multi_point_test.py).
+- Runtime shape now matches the frozen design:
+  - standalone entry:
+    - `python -m inspector.pseudo_multi_point_test`
+  - one real recognition preset from the existing calibration JSON
+  - one transition preset used only to force departure before each recognition round
+  - direct in-process reuse of `RunOnceService.run(...)`
+  - no extra recognition rules or alternate recognition logic
+- Implemented the fixed round template:
+  - turn to transition preset
+  - on success, call `RunOnceService.run(...)` for the calibration preset
+  - collect the structured recognition result
+  - continue immediately to the next round
+- Added dedicated pseudo multi-point result models:
+  - transition step result
+  - per-round result
+  - final run summary
+- Added per-run output directory behavior:
+  - one new run directory per execution
+  - `summary.json`
+  - `round_01.json`, `round_02.json`, ...
+- Added incremental trace persistence:
+  - each round JSON is written immediately after that round completes
+  - interrupted or aborted runs still preserve already-finished round files plus a final partial summary
+- Added scheduler-level timeout observation fields:
+  - `transitionPresetTimeoutSeconds`
+  - `roundTimeoutSeconds`
+  - `transitionPreset.timedOut`
+  - `roundTimedOut`
+- Kept timeout handling intentionally non-invasive:
+  - current timeout semantics are soft observation only
+  - the tool marks timeout overruns in results and summaries
+  - it does not forcibly cancel the inner `RunOnceService` chain in this first implementation
+- Added optional scene-mode override support:
+  - default inherits `backend/local_config.json`
+  - optional CLI override supports `auto` / `day_visible` / `night_ir`
+- Validation completed in Codex runtime:
+  - bundled runtime `python -m compileall inspector backend/app` passed
+  - bundled runtime `python -m inspector.pseudo_multi_point_test --help` passed
+
+## 2026-07-08 phase-1 preview background-power fix
+
+- Fixed the calibration preview player to treat browser background power-saving pauses as a first-class playback state instead of a normal hard playback failure.
+- Updated [useStreamPlayer.ts](C:/Users/Maple_Rain/Documents/Items/splash_water/frontend/src/hooks/useStreamPlayer.ts) so that:
+  - `play()` is deferred when the document is hidden
+  - background-media `AbortError` is no longer escalated as a normal player error
+  - `waiting/stalled` auto-recover is suppressed while the page is hidden
+  - visibility return triggers a live-edge recovery pass instead of letting the preview keep drifting behind
+  - reload attempts are deferred while hidden, then resumed after the page becomes visible again
+- Expected effect:
+  - fewer false `Preview play failed (...)` errors when the browser power-saves background video
+  - lower chance of the preview silently falling minutes behind after tab/background suspension
+- Validation:
+  - frontend `tsc --noEmit` passed
+
+## 2026-07-08 pseudo multi-point transition-settle fix
+
+- Adjusted only the pseudo multi-point scheduler, without changing:
+  - `RunOnceService` recognition main chain
+  - day/night recognition parameters
+  - temporal-vote thresholds
+  - any visual-stability or recognition gating logic
+- Fix purpose:
+  - prevent preset-2 transition from being interrupted too early
+  - ensure the camera can complete the basic mechanical / zoom movement at preset 2
+  - only then call back into preset-1 recognition
+  - reduce pseudo multi-point rounds that were being compressed from expected `has_splash` into `undetermined` because the return-to-preset-1 sequence was still unstable
+- Updated [inspector/pseudo_multi_point_test.py](C:/Users/Maple_Rain/Documents/Items/splash_water/inspector/pseudo_multi_point_test.py):
+  - added CLI parameter:
+    - `--transition-settle-ms`
+  - added runtime config field:
+    - `transitionSettleMs`
+  - changed round flow from:
+    - `turn transition preset -> immediately call RunOnceService.run(...)`
+  - to:
+    - `turn transition preset -> wait transitionSettleMs -> call RunOnceService.run(...)`
+- Added round-level trace fields:
+  - `transitionSettleMsConfigured`
+  - `transitionSettleWaitMsActual`
+- Added summary-level scheduling snapshot field:
+  - `transitionSettleMs`
+- Added operator-visible runtime log:
+  - `transition preset accepted, waiting <ms> ms before recognition`
+- This round is explicitly a scheduler-precondition repair, not an algorithm-tuning round.
+- Local validation in Codex runtime:
+  - bundled runtime `python -m compileall inspector backend/app` passed
+  - synthetic one-round harness confirmed:
+    - wait log is emitted
+    - `round_*.json` model carries transition-settle fields
+    - `summary.json` model carries `transitionSettleMs`
+
+## 2026-07-08 phase-1 preview stream-refresh escalation fix
+
+- Reworked only the phase-1 calibration preview recovery strategy.
+- Explicitly did not change:
+  - PTZ
+  - preset control
+  - calibration save
+  - phase-2 recognition runtime
+  - recognition parameters
+  - Dahua backend protocol
+- Fixed the FLV dead-link recovery gap:
+  - old behavior could stay on one broken FLV URL and keep doing reload / play on the same dead session
+  - new behavior now distinguishes:
+    - light recovery for ordinary `waiting` / `stalled`
+    - heavy recovery for FLV/network-layer failures
+- Updated `frontend/src/hooks/useStreamPlayer.ts`:
+  - added `onStreamRefreshNeeded`
+  - ordinary `waiting` / `stalled` still use:
+    - seek live edge
+    - replay
+    - soft player reload
+  - network-layer errors now request outer refresh instead of looping forever on the same URL
+  - current heavy-refresh trigger family includes signals such as:
+    - `FLV player error: NetworkError / Exception`
+    - `Failed to fetch`
+    - `ERR_EMPTY_RESPONSE`
+    - `IOException`
+  - if the page is hidden, heavy refresh is deferred until the document returns to visible
+- Updated `frontend/src/pages/CalibrationPage.tsx`:
+  - page layer now owns the real `getPreferredStream(...)` refresh
+  - successful refresh updates stream state and bumps a restart token so the player rebuilds even if the backend returns the same URL string
+  - added auto-refresh cooldown:
+    - `STREAM_REFRESH_COOLDOWN_MS = 3000`
+  - added logs:
+    - `Preview stream refresh requested: ...`
+    - `Preview stream refresh succeeded`
+    - `Preview stream refresh skipped: cooldown active`
+    - `Preview stream refresh failed: ...`
+- Updated `frontend/src/components/StreamPreview.tsx`:
+  - manual `Reconnect Preview` now follows the same real refresh path
+  - no longer just restarts the old player on the old URL
+- Local validation:
+  - bundled runtime `python -m compileall inspector backend/app` unaffected
+  - `useStreamPlayer` / `CalibrationPage` code path manually checked for:
+    - heavy refresh callback wiring
+    - page-layer cooldown
+    - player rebuild via restart token
+  - frontend full `tsc` validation could not be completed cleanly in this turn because the current workspace `node_modules` state tried to trigger blocked registry access during package-manager-based validation
+
+## 2026-07-08 phase-1 preview stability fallback tuning
+
+- Reworked only the phase-1 preview-player stability tuning layer.
+- This round is explicitly not:
+  - lower-latency chasing
+  - PTZ / preset logic change
+  - ROI or save-flow change
+  - phase-2 recognition change
+- Main goal:
+  - reduce `waiting` frequency
+  - shorten visible freeze windows
+  - keep the preview in a stable low-latency operating range instead of the earlier aggressive ultra-thin-buffer setup
+- Updated `frontend/src/hooks/useStreamPlayer.ts` FLV config from the previous aggressive profile back toward a stable low-latency profile:
+  - `enableStashBuffer: true`
+  - `stashInitialSize: 128`
+  - `fixAudioTimestampGap: true`
+  - `autoCleanupMaxBackwardDuration: 6`
+  - `autoCleanupMinBackwardDuration: 3`
+- Added waiting/stalled recovery throttling:
+  - repeated short-interval `waiting` / `stalled` now do not keep rescheduling the full recover chain
+  - first event still uses the existing light recovery flow:
+    - seek live edge
+    - replay or wait for data
+    - soft reload if still blocked
+  - repeated events within the short throttle window are now suppressed as recovery triggers
+- Added waiting/stalled log throttling:
+  - key logs are retained
+  - same-second repeated waiting noise is reduced
+- Heavy refresh behavior remains preserved:
+  - true FLV/network-layer failure can still escalate to:
+    - re-fetch stream URL
+    - rebuild player
+  - ordinary `waiting` is still not upgraded to stream-address refresh
+- Local validation:
+  - source-level review confirmed the stable-parameter rollback and recovery throttling are isolated to `useStreamPlayer.ts`
+  - no PTZ / preset / calibration-save / phase-2 files were changed in this round
+
+## 2026-07-09 calibration payload slimming and global runtime config split
+
+- Narrowed phase-1 calibration persistence so each saved calibration JSON now describes only the preset target and ROI, instead of duplicating runtime tuning knobs per file.
+- Removed these runtime knobs from saved calibration records:
+  - `captureDurationMs`
+  - `ptzSettleMs`
+  - `ptzExtraSettleMs`
+  - `presetTurnSettleMs`
+  - `streamCatchupMs`
+  - `streamUnreadyDebounceMs`
+  - `visualStableWindowMs`
+  - `visualStableSampleMs`
+  - `visualStableThreshold`
+  - `visualStableGraceThreshold`
+- Current saved calibration payload is now limited to:
+  - `deviceId`
+  - `channelId`
+  - `targetId`
+  - `targetName`
+  - `presetIndex`
+  - `presetName`
+  - `roi`
+  - `notes`
+  - `snapshotPath`
+  - `snapshotUrl`
+  - `updatedAt`
+- Added backend runtime-config endpoint:
+  - `GET /api/calibration/runtime-config`
+- Added new phase-1 global config block in:
+  - `backend/local_config.json`
+  - `backend/local_config.example.json`
+  - block name: `calibration_tool`
+- Ownership is now split intentionally:
+  - phase-1 preview / capture-gate runtime knobs come from `calibration_tool`
+  - phase-2 settle knobs `presetTurnSettleMs` and `streamCatchupMs` remain under `recognition_v1`
+- Updated phase-1 frontend so page runtime behavior no longer reads these knobs from the calibration draft or saved calibration file:
+  - PTZ extra settle
+  - preset-turn settle
+  - stream catch-up
+  - unready debounce
+  - visual-stability sampling / thresholds
+- Backward compatibility kept:
+  - old calibration JSON files can still be loaded
+  - legacy runtime fields are ignored on read
+  - new saves no longer write them back
+- Local validation:
+  - bundled runtime `python -m compileall backend/app inspector` passed
+  - frontend `tsc --noEmit` passed with the bundled Node + local TypeScript
+- Follow-up guard:
+  - phase-1 page now keeps PTZ / preset / capture gated until `GET /api/calibration/runtime-config` finishes successfully
+  - this closes the remaining gap where the first operator action could still run once on frontend fallback defaults before backend global config arrived
+
+## 2026-07-09 pseudo multi-point transition timing follow-up
+
+- Kept the recognition algorithm and thresholds unchanged.
+- Adjusted only the pseudo multi-point scheduler-side timing default:
+  - `--transition-settle-ms` default raised from `1200` to `1800`
+- Reason:
+  - recent intermittent pseudo multi-point misses looked more consistent with early sampling after preset return than with scene-mode routing or algorithm-body failure
+  - representative failures can show the splash body shifted left or compositionally incomplete
+- Strengthened round-level trace output so comparison is easier without drilling into deeply nested result fields:
+  - `recognitionExecutionResult`
+  - `recognitionEffectiveSceneMode`
+  - `recognitionPresetTurnMs`
+  - `recognitionSettleWaitMs`
+  - `recognitionSampleMs`
+  - `recognitionDetectMs`
+  - `representativeFramePath`
+  - `debugImagePath`
+- Added a summary-level review rule:
+  - if routing is normal and motion-overflow is absent but the representative frame is compositionally shifted, treat it as scheduling/composition timing first, not threshold drift first
+
+## 2026-07-09 visual readiness gate and static bright suppression
+
+- Added a pre-detection visual-readiness gate to phase-2 `run_once`:
+  - preset turn
+  - fixed settle wait
+  - open FLV stream
+  - run visual readiness check
+  - only if ready, sample the formal recognition sequence
+  - then continue into the existing recognition chain
+- Added new module:
+  - `inspector/visual_readiness.py`
+- Current visual-readiness check is intentionally lightweight and explainable:
+  - Laplacian-variance sharpness
+  - consecutive-frame pass requirement
+  - simple frame-to-frame stability score
+  - readiness focus now prefers the target ROI (with a small outward margin) instead of a generic full-frame center crop,
+    so unrelated sharp edges elsewhere in the preview cannot falsely certify a blurry target area as visually ready
+  - readiness no longer passes immediately after the first 4 buffered frames; it now requires both
+    a minimum elapsed wait and a minimum sustained ready window, so "stable but still defocused" startup frames
+    are much less likely to slip into formal recognition in ~30 ms
+  - visual-readiness diagnostics now also expose:
+    - `sharpnessTrend`
+    - `sharpnessImprovementRatio`
+    - `readyWindowMsActual`
+    - `minElapsedGatePassed`
+    - `minReadyWindowGatePassed`
+    - `stableBlurRejected`
+  - replay evidence now keeps three ROI key frames for easier pseudo-multi-point review:
+    - readiness start frame
+    - readiness-ready / pre-pass last frame
+    - formal sample first frame
+- Added new phase-2 failure semantics:
+  - `visual_not_ready`
+  - `visual_not_ready_timeout`
+  - `visual_blurry_before_detection`
+- Current behavior on readiness failure:
+  - do not continue into normal recognition
+  - return `visualState = undetermined`
+  - include readiness metrics and timing in the structured result
+  - best-effort persist replay material from the readiness frames themselves for troubleshooting
+- Added new result/timing fields:
+  - `visualReadinessPassed`
+  - `visualReadinessReason`
+  - `visualReadiness`
+  - `timing.visualReadinessMs`
+- Added replay metadata propagation for:
+  - readiness pass/fail
+  - readiness reason
+  - readiness metric snapshot
+- Added pseudo multi-point round summaries for:
+  - readiness pass/fail
+  - readiness reason
+  - readiness timing
+  - readiness sharpness/stability metrics
+- Added a conservative static-bright-interference suppression gate:
+  - only after normal frame voting is already strong enough to become `has_splash`
+  - suppresses large, centered, continuous bright objects whose main bright-body dynamics remain too weak
+  - intended to reduce false positives from nearby static white foam devices without broadly loosening/tightening the day/night main thresholds
+- Added lightweight automated regression coverage:
+  - `tests/test_recognition_guards.py`
+  - covers:
+    - sharp vs blurry readiness-score separation
+    - static bright interference gate forcing a false-positive-shaped summary back to `no_splash`
+    - readiness failure result mapping
+    - pseudo multi-point summary counters for readiness/static-bright outcomes
+    - consecutive-frame readiness pass behavior
+- Pseudo multi-point failure-step semantics now treat:
+  - `visual_not_ready`
+  - `visual_not_ready_timeout`
+  - `visual_blurry_before_detection`
+  as `failureStep = visual_readiness`, instead of mixing them into generic recognition-execution failures
+- `summary.json` now also exposes a dedicated `visualBlurryBeforeDetectionRounds` counter, so no-splash pseudo-multi-point review can separate
+  "blurred before formal detection" from "waited but still timed out" without digging through the full execution breakdown first
+
+## 2026-07-13 focus-anchor ROI split
+
+- Added `focusAnchorRoi` to calibration save schema, calibration record, frontend draft types, and runtime target model.
+- Calibration UI now supports dual ROI editing on the same frozen frame:
+  - `识别 ROI`
+  - `对焦 ROI`
+- Runtime split is now explicit:
+  - readiness and sample-quality guard use `focusAnchorRoi`
+  - detection / scoring / temporal voting still use `roi`
+- Replay metadata now records:
+  - `roi`
+  - `focusAnchorRoi`
+  - `resolvedFocusAnchorRoi`
+  - `focusAnchorRoiSource`
+  - `focusAnchorRoiFallbackUsed`
+- Legacy calibration compatibility is preserved by falling back from missing `focusAnchorRoi` to `roi`, while surfacing the fallback in result metadata.

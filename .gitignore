@@ -1,0 +1,22 @@
+# Local runtime configuration may contain camera endpoints and credentials.
+backend/local_config.json
+
+# Generated recognition evidence and ad-hoc replay analysis.
+data/
+run_once_result*.json
+run_once_result_*/
+tmp*/
+
+# Local runtimes, package caches, and build outputs.
+.venv/
+.pnpm-store/
+frontend/node_modules/
+frontend/dist/
+__pycache__/
+*.py[cod]
+
+# Local editor metadata and environment files.
+.idea/
+.env
+.env.*
+!.env.example

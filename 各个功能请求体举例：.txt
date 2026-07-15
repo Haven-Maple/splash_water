@@ -1,0 +1,37 @@
+后端启动：python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+前端启动：npm run dev
+测试命令：python -m inspector.run_once --config data/calibrations/AB00A7DPAJ00124_1.json --preset 1 > run_once_result.json
+10轮巡检预置点1测试命令：python -m inspector.pseudo_multi_point_test --config data/calibrations/AB00A7DPAJ00124_1.json --transition-preset 2 --rounds 10 --expected-visual-state has_splash --transition-settle-ms 1200
+各个功能请求体举例：
+云台控制请求体
+{
+    "deviceId":"8E0A090PAG6A67D",
+    "channelId":"0",
+    "operation":"10",
+    "duration":1000,
+    "horizontalSpeed":0.25,
+    "verticalSpeed":0.25
+}
+hls/flv流查询
+{
+    "deviceId": "AC02295****00343",
+    "channelId": "0"
+}
+预置点设置
+{
+  "deviceId": "AA03012YXXXXX",
+  "channelId": "0",
+  "name": "vnGji",
+  "index": 10
+}
+转动到预置点
+{
+    "deviceId": "AA03012YXXXXXXX",
+    "channelId": "0",
+    "index": 9
+}
+查询预置点
+{
+  "deviceId": "AA03012YXXXXX",
+  "channelId": "0"
+}
