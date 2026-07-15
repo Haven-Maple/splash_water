@@ -1,121 +1,30 @@
-# Night Visible / IR Transition Deferred Record
+# 夜间全彩 / IR 切换延期记录
 
-Date: 2026-07-14
+日期：2026-07-15
 
-## Status
+## 状态
 
-Deferred deliberately. This is a documented field-environment risk, not an active recognition-algorithm defect to tune in the current single-aerator setup.
+已延期，且当前部署通过摄像头配置规避：夜间固定红外黑白成像。`night_visible` 不是当前可选场景 profile。
 
-## Problem
+## 已知现象
 
-At night, a camera can remain in color mode when one preset includes supplementary lighting and later switch to monochrome infrared after moving away from that light. The transition is camera-controlled and may be delayed or hysteretic:
+当不同预置点的补光条件不同，摄像头可能在彩色与 IR 之间缓慢、带滞回地切换。切换可发生在两轮识别之间，也可能在预置点到达后延迟发生；因此一次 scene probe 不能保证代表整段采样的成像模式。
 
-- entering a darker target preset does not guarantee immediate IR switching
-- returning to the lit preset does not guarantee immediate color switching
-- the mode can change between recognition rounds rather than during the scene-stability probe
+这个现象是摄像头成像状态的不确定性，不应通过放宽 splash 阈值、增加固定等待或在当前单增氧机环境中维护第三套识别参数来掩盖。
 
-This makes a physical-time label such as "night" insufficient. The recognition path must use the actual current image profile.
+## 当前决策
 
-## Confirmed Evidence
+- 夜间摄像头配置为固定 IR 黑白模式。
+- `auto` 只在稳定图像上选择 `day_visible` 或 `night_ir`；`day_visible_twilight` 仅是白天等待预算子档。
+- 识别运行中检测到不稳定场景时，应返回可复盘的流程失败或重锁结果，而不是猜测夜间全彩规则。
 
-The following pseudo multi-point run alternated from preset 2 to recognition preset 1:
+## 重新开启条件
 
-- [summary.json](C:/Users/Maple_Rain/Documents/Items/splash_water/data/pseudo_multi_point_tests/AB00A7DPAJ00124_1_p1_t2_no_splash_2026-07-13T17-35-37.416192+00-00/summary.json)
-- [round_02.json](C:/Users/Maple_Rain/Documents/Items/splash_water/data/pseudo_multi_point_tests/AB00A7DPAJ00124_1_p1_t2_no_splash_2026-07-13T17-35-37.416192+00-00/round_02.json)
-- [round_03.json](C:/Users/Maple_Rain/Documents/Items/splash_water/data/pseudo_multi_point_tests/AB00A7DPAJ00124_1_p1_t2_no_splash_2026-07-13T17-35-37.416192+00-00/round_03.json)
+只有在多增氧机现场确实必须同时支持补光全彩与 IR，且具备以下证据时，才重新评估 `night_visible`：
 
-Observed pattern:
+- 稳定夜间全彩的有水花与无水花 replay。
+- 至少一次带时间戳、关键帧和场景诊断的运行中模式切换记录。
+- 可重复测量的切换方向、触发条件和延迟。
+- 证明新 profile 不会降低既有白天与 IR 基线的回归结果。
 
-- rounds 1-2: stable color image, resolved as `day_visible_twilight`
-- rounds 3-10: stable monochrome image, resolved as `night_ir`
-- every individual round had `sceneModeStable=true` and `sceneModeTransitionObserved=false`
-
-The switch therefore happened between rounds. This is useful evidence of slow mode response, but it is not a reproduction of an in-round transition.
-
-Additional night-color samples show a distinct low-light color cluster:
-
-- brightness mean: approximately 74-113
-- colorfulness mean: approximately 16-20
-- saturation P90: approximately 0.38-0.50
-- channel delta mean: approximately 11-15
-- channel correlation: approximately 0.97-0.98
-
-The cluster is distinct from both reference daylight and true IR. It is suitable for later `night_visible` classifier work, but not yet for changing splash thresholds.
-
-## Current Runtime Decision
-
-Keep the current scene-stability guard enabled for `sceneMode=auto`:
-
-1. Flush startup stream frames.
-2. Require two complete, compatible scene-probe windows.
-3. Use the resolved current profile for readiness and sampling.
-4. On a blurry readiness failure, permit at most one scene re-lock.
-
-When no profile change occurs during a round, selecting the image profile actually present at probe time is correct. The system must not force an expected profile merely because a different preset has supplementary lighting.
-
-## Explicit Non-Changes While Deferred
-
-- Do not add a fixed multi-second wait after every preset movement.
-- Do not increase `sceneModeStabilityTimeoutMs` based on the current random observation.
-- Do not lower readiness sharpness thresholds to make low-light color frames pass.
-- Do not modify splash scoring, voting, white-foam suppression, or existing day/IR baselines.
-- Do not introduce `night_visible` as an active detection profile until multi-aerator field samples include both `no_splash` and `has_splash` cases.
-
-## Reopen Triggers
-
-Resume this work when at least one condition is true:
-
-- a multi-aerator environment has targets with materially different supplementary-light conditions
-- an in-round color-to-IR or IR-to-color change is captured after the recognition preset is reached
-- stable night-color targets become a routine production condition
-- field failures show repeated `scene_mode_transition_timeout`, re-locks, or profile-dependent readiness failures
-
-## Reopen Plan
-
-Before changing recognition settings, build or run a dedicated scene-transition trace. It must not run readiness, sampling, or splash detection.
-
-For each direction, record a full-frame scene decision every 200-300 ms:
-
-1. Hold preset 2 for 0, 2, 5, 8, and 12 seconds.
-2. Move to preset 1 and observe for 12 seconds.
-3. Repeat the reverse direction.
-4. Repeat each dwell duration at least three times.
-5. Run one no-movement 30-second observation at each preset.
-
-Persist for every window:
-
-- preset identifier and elapsed time since movement completion
-- resolved mode and confidence
-- brightness, colorfulness, saturation, channel delta, and channel correlation
-- full-frame evidence at trace start, every mode change, and trace end
-
-This trace distinguishes the relevant causes:
-
-- switching while stationary points to ambient-light threshold or exposure control
-- switching only after a dwell interval points to camera hysteresis
-- switching only after PTZ movement points to motion/focus/exposure coupling
-
-## Future `night_visible` Candidate
-
-Only after the trace and multi-aerator samples are available, consider a third image profile. Initial classifier candidates, derived from the current stable night-color sample cluster, are:
-
-```json
-{
-  "nightVisibleMaxBrightnessMean": 118.0,
-  "nightVisibleMinColorfulness": 14.0,
-  "nightVisibleMaxColorfulness": 30.0,
-  "nightVisibleMinSaturationP90": 0.32,
-  "nightVisibleMinChannelDeltaMean": 9.5,
-  "nightVisibleMaxChannelCorrelation": 0.982
-}
-```
-
-The first `night_visible` profile should inherit the current `day_visible_twilight` readiness and sample-quality budgets. It must retain the current splash thresholds until separate positive and negative night-color validation exists.
-
-## Acceptance Criteria For Reopening
-
-- The trace captures at least one mode transition with timestamps and evidence frames.
-- The expected transition direction and latency are measurable across repeated trials.
-- `night_visible`, if enabled, is distinguishable from both stable daylight and stable IR with explicit diagnostics.
-- No fixed waiting is added to stable runs.
-- Existing `day_visible` and `night_ir` baselines remain unchanged and pass regression.
+在上述条件满足前，不增加第三套 splash 阈值，不增加固定转点等待，也不降低判稳清晰度门槛。
