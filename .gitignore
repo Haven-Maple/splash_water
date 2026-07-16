@@ -12,6 +12,7 @@ tmp*/
 .pnpm-store/
 frontend/node_modules/
 frontend/dist/
+backend/app/logs/
 __pycache__/
 *.py[cod]
 

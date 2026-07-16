@@ -125,6 +125,19 @@ class PseudoMultiPointRoundResult(BaseModel):
     sampleQualityWindowMaxAllowedMs: int | None = None
     sampleQualityReusedReadinessFrames: int | None = None
     sampleQualityRestartedDuringSampling: bool | None = None
+    sampleQualityRejectSharpnessCount: int | None = None
+    sampleQualityRejectClearCellRatioCount: int | None = None
+    sampleQualityRejectStabilityCount: int | None = None
+    sampleQualityFirstRejectedFrameIndex: int | None = None
+    sampleQualityFirstRejectedElapsedMs: int | None = None
+    sampleQualityFirstRejectedSharpness: float | None = None
+    sampleQualityFirstRejectedClearCellRatio: float | None = None
+    sampleQualityFirstRejectedStability: float | None = None
+    sampleQualityLastRejectedFrameIndex: int | None = None
+    sampleQualityLastRejectedElapsedMs: int | None = None
+    sampleQualityLastRejectedSharpness: float | None = None
+    sampleQualityLastRejectedClearCellRatio: float | None = None
+    sampleQualityLastRejectedStability: float | None = None
     sampleQualityWindowTooLongRejected: bool | None = None
     sampleQualityWindowTooLongCandidateFrameCount: int | None = None
     sampleQualityWindowTooLongTriggerSharpness: float | None = None
@@ -777,6 +790,71 @@ class PseudoMultiPointRunner:
             if recognition_result is not None and recognition_result.sampleQuality is not None
             else None
         )
+        sample_quality_reject_sharpness_count = (
+            recognition_result.sampleQuality.rejectSharpnessCount
+            if recognition_result is not None and recognition_result.sampleQuality is not None
+            else None
+        )
+        sample_quality_reject_clear_cell_ratio_count = (
+            recognition_result.sampleQuality.rejectClearCellRatioCount
+            if recognition_result is not None and recognition_result.sampleQuality is not None
+            else None
+        )
+        sample_quality_reject_stability_count = (
+            recognition_result.sampleQuality.rejectStabilityCount
+            if recognition_result is not None and recognition_result.sampleQuality is not None
+            else None
+        )
+        sample_quality_first_rejected_frame_index = (
+            recognition_result.sampleQuality.firstRejectedFrameIndex
+            if recognition_result is not None and recognition_result.sampleQuality is not None
+            else None
+        )
+        sample_quality_first_rejected_elapsed_ms = (
+            recognition_result.sampleQuality.firstRejectedElapsedMs
+            if recognition_result is not None and recognition_result.sampleQuality is not None
+            else None
+        )
+        sample_quality_first_rejected_sharpness = (
+            recognition_result.sampleQuality.firstRejectedSharpness
+            if recognition_result is not None and recognition_result.sampleQuality is not None
+            else None
+        )
+        sample_quality_first_rejected_clear_cell_ratio = (
+            recognition_result.sampleQuality.firstRejectedClearCellRatio
+            if recognition_result is not None and recognition_result.sampleQuality is not None
+            else None
+        )
+        sample_quality_first_rejected_stability = (
+            recognition_result.sampleQuality.firstRejectedStability
+            if recognition_result is not None and recognition_result.sampleQuality is not None
+            else None
+        )
+        sample_quality_last_rejected_frame_index = (
+            recognition_result.sampleQuality.lastRejectedFrameIndex
+            if recognition_result is not None and recognition_result.sampleQuality is not None
+            else None
+        )
+        sample_quality_last_rejected_elapsed_ms = (
+            recognition_result.sampleQuality.lastRejectedElapsedMs
+            if recognition_result is not None and recognition_result.sampleQuality is not None
+            else None
+        )
+        sample_quality_last_rejected_sharpness = (
+            recognition_result.sampleQuality.lastRejectedSharpness
+            if recognition_result is not None and recognition_result.sampleQuality is not None
+            else None
+        )
+        sample_quality_last_rejected_clear_cell_ratio = (
+            recognition_result.sampleQuality.lastRejectedClearCellRatio
+            if recognition_result is not None and recognition_result.sampleQuality is not None
+            else None
+        )
+        sample_quality_last_rejected_stability = (
+            recognition_result.sampleQuality.lastRejectedStability
+            if recognition_result is not None and recognition_result.sampleQuality is not None
+            else None
+        )
         sample_quality_window_too_long_rejected = (
             recognition_result.sampleQuality.windowTooLongRejected
             if recognition_result is not None and recognition_result.sampleQuality is not None
@@ -1026,6 +1104,19 @@ class PseudoMultiPointRunner:
             sampleQualityWindowMaxAllowedMs=sample_quality_window_max_allowed_ms,
             sampleQualityReusedReadinessFrames=sample_quality_reused_readiness_frames,
             sampleQualityRestartedDuringSampling=sample_quality_restarted_during_sampling,
+            sampleQualityRejectSharpnessCount=sample_quality_reject_sharpness_count,
+            sampleQualityRejectClearCellRatioCount=sample_quality_reject_clear_cell_ratio_count,
+            sampleQualityRejectStabilityCount=sample_quality_reject_stability_count,
+            sampleQualityFirstRejectedFrameIndex=sample_quality_first_rejected_frame_index,
+            sampleQualityFirstRejectedElapsedMs=sample_quality_first_rejected_elapsed_ms,
+            sampleQualityFirstRejectedSharpness=sample_quality_first_rejected_sharpness,
+            sampleQualityFirstRejectedClearCellRatio=sample_quality_first_rejected_clear_cell_ratio,
+            sampleQualityFirstRejectedStability=sample_quality_first_rejected_stability,
+            sampleQualityLastRejectedFrameIndex=sample_quality_last_rejected_frame_index,
+            sampleQualityLastRejectedElapsedMs=sample_quality_last_rejected_elapsed_ms,
+            sampleQualityLastRejectedSharpness=sample_quality_last_rejected_sharpness,
+            sampleQualityLastRejectedClearCellRatio=sample_quality_last_rejected_clear_cell_ratio,
+            sampleQualityLastRejectedStability=sample_quality_last_rejected_stability,
             sampleQualityWindowTooLongRejected=sample_quality_window_too_long_rejected,
             sampleQualityWindowTooLongCandidateFrameCount=sample_quality_window_too_long_candidate_frame_count,
             sampleQualityWindowTooLongTriggerSharpness=sample_quality_window_too_long_trigger_sharpness,

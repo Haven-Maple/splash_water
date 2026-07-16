@@ -13,6 +13,7 @@ from unittest.mock import Mock, PropertyMock, patch
 import numpy as np
 
 import inspector.flv_sampler as flv_sampler_module
+import inspector.night_ir_gap_fill_scan as gap_fill_scan_module
 from inspector.config import RecognitionGlobalConfig, build_recognition_config
 from inspector.flv_sampler import FlvSamplerError, FlvStreamSession
 from inspector.frame_scoring import WeightedFrameScorer
@@ -796,16 +797,16 @@ class NightGapFillThresholdTests(unittest.TestCase):
             frameHeight=4,
         )
 
-    def test_night_ir_fragmented_true_splash_passes_with_gap_fill_081(self) -> None:
+    def test_night_ir_fragmented_true_splash_passes_with_gap_fill_076(self) -> None:
         config = RecognitionGlobalConfig(
             sceneMode="night_ir",
             sequenceVoteThreshold=0.6,
             framePassThreshold=0.3,
-            hardGateMinGapFillRatio=0.81,
+            hardGateMinGapFillRatio=0.76,
         )
         service = RunOnceService(global_config=config, raw_config={"sceneMode": "night_ir"})
-        features = [self._night_feature(index, gap_fill_ratio=0.821) for index in range(17)] + [
-            self._night_feature(index + 17, gap_fill_ratio=0.79) for index in range(3)
+        features = [self._night_feature(index, gap_fill_ratio=0.768) for index in range(19)] + [
+            self._night_feature(index + 19, gap_fill_ratio=0.74) for index in range(1)
         ]
         frame_scores = WeightedFrameScorer(config).score(features)
         score_summary = service._score_summary(
@@ -817,18 +818,18 @@ class NightGapFillThresholdTests(unittest.TestCase):
 
         decision = TemporalVoteResolver(config).resolve(score_summary)
 
-        self.assertEqual(score_summary.gapFillPassCount, 17)
-        self.assertEqual(score_summary.hardGateMinGapFillRatioConfigured, 0.81)
-        self.assertEqual(score_summary.framePassCount, 17)
+        self.assertEqual(score_summary.gapFillPassCount, 19)
+        self.assertEqual(score_summary.hardGateMinGapFillRatioConfigured, 0.76)
+        self.assertEqual(score_summary.framePassCount, 19)
         self.assertEqual(decision.visualState, "has_splash")
         self.assertEqual(decision.reason, "pass_ratio_high")
 
-    def test_night_ir_no_splash_stays_blocked_with_gap_fill_081(self) -> None:
+    def test_night_ir_no_splash_stays_blocked_with_gap_fill_076(self) -> None:
         config = RecognitionGlobalConfig(
             sceneMode="night_ir",
             sequenceVoteThreshold=0.6,
             framePassThreshold=0.3,
-            hardGateMinGapFillRatio=0.81,
+            hardGateMinGapFillRatio=0.76,
         )
         service = RunOnceService(global_config=config, raw_config={"sceneMode": "night_ir"})
         features = [self._night_feature(index, gap_fill_ratio=0.592) for index in range(20)]
@@ -846,6 +847,127 @@ class NightGapFillThresholdTests(unittest.TestCase):
         self.assertEqual(score_summary.framePassCount, 0)
         self.assertEqual(decision.visualState, "no_splash")
         self.assertEqual(decision.reason, "pass_ratio_low")
+
+    def test_night_ir_boundary_threshold_0760_is_first_temporal_vote_pass(self) -> None:
+        features = [self._night_feature(index, gap_fill_ratio=0.768) for index in range(11)] + [
+            self._night_feature(11, gap_fill_ratio=0.762)
+        ] + [
+            self._night_feature(index + 12, gap_fill_ratio=0.74) for index in range(8)
+        ]
+
+        config_0765 = RecognitionGlobalConfig(
+            sceneMode="night_ir",
+            sequenceVoteThreshold=0.6,
+            framePassThreshold=0.3,
+            hardGateMinGapFillRatio=0.765,
+        )
+        service_0765 = RunOnceService(global_config=config_0765, raw_config={"sceneMode": "night_ir"})
+        frame_scores_0765 = WeightedFrameScorer(config_0765).score(features)
+        score_summary_0765 = service_0765._score_summary(
+            effective_config=config_0765,
+            sequence=self._dummy_sequence(len(features)),
+            frame_features=features,
+            frame_scores=frame_scores_0765,
+        )
+        decision_0765 = TemporalVoteResolver(config_0765).resolve(score_summary_0765)
+
+        config_0760 = RecognitionGlobalConfig(
+            sceneMode="night_ir",
+            sequenceVoteThreshold=0.6,
+            framePassThreshold=0.3,
+            hardGateMinGapFillRatio=0.76,
+        )
+        service_0760 = RunOnceService(global_config=config_0760, raw_config={"sceneMode": "night_ir"})
+        frame_scores_0760 = WeightedFrameScorer(config_0760).score(features)
+        score_summary_0760 = service_0760._score_summary(
+            effective_config=config_0760,
+            sequence=self._dummy_sequence(len(features)),
+            frame_features=features,
+            frame_scores=frame_scores_0760,
+        )
+        decision_0760 = TemporalVoteResolver(config_0760).resolve(score_summary_0760)
+
+        self.assertEqual(score_summary_0765.gapFillPassCount, 11)
+        self.assertEqual(score_summary_0765.framePassCount, 11)
+        self.assertEqual(decision_0765.visualState, "undetermined")
+        self.assertEqual(decision_0765.reason, "pass_ratio_middle_band")
+        self.assertEqual(score_summary_0760.gapFillPassCount, 12)
+        self.assertEqual(score_summary_0760.framePassCount, 12)
+        self.assertEqual(decision_0760.visualState, "has_splash")
+        self.assertEqual(decision_0760.reason, "pass_ratio_high")
+
+
+class NightGapFillScannerTests(unittest.TestCase):
+    def test_scanner_evaluates_each_case_with_its_snapshot_config(self) -> None:
+        target = RecognitionTarget(
+            deviceId="device",
+            channelId="0",
+            presetIndex=1,
+            presetName="preset",
+            targetId="target",
+            targetName="target",
+            roi={"x": 0, "y": 0, "width": 4, "height": 4},
+        )
+        case = gap_fill_scan_module.ReplayCase(
+            runId="run",
+            roundIndex=1,
+            expectedVisualState="no_splash",
+            currentVisualState="no_splash",
+            currentExecutionResult="success",
+            sequencePath=Path("sequence.npz"),
+            configSnapshotPath=Path("recognition-config.snapshot.json"),
+            target=target,
+            sampledFrameCount=20,
+            targetFrameCount=20,
+            configuredSampleFps=10.0,
+            actualSampleFps=10.0,
+            configuredSampleDurationMs=1900,
+            actualSampleDurationMs=1900,
+        )
+        features = [
+            NightGapFillThresholdTests._night_feature(index, gap_fill_ratio=0.80)
+            for index in range(20)
+        ]
+        cached_case = gap_fill_scan_module.CachedReplayCase(
+            case=case,
+            sequence=NightGapFillThresholdTests._dummy_sequence(20),
+            baseRawConfig={
+                "sceneMode": "night_ir",
+                "sequenceVoteThreshold": 0.6,
+                "sequenceFrameCount": 20,
+                "framePassThreshold": 0.3,
+                "hardGateMinLargestBrightComponentRatio": 0.5,
+                "hardGateMinCenterBrightCoverage": 0.2,
+                "hardGateMinVerticalSpreadRatio": 0.1,
+                "hardGateMinContinuousBrightRatio": 0.1,
+                "hardGateMinLocalMotion": 0.0,
+                "hardGateMinDynamicAreaRatio": 0.0,
+                "hardGateMinHighlightMotion": 0.0,
+                "hardGateMinGapFillRatio": 0.9,
+                "hardGateMinTemporalAreaVariance": 0.0,
+                "hardGateMinTemporalShapeVariance": 0.0,
+            },
+            alignedSequence=AlignedSequence(
+                alignedFrames=np.zeros((20, 4, 4, 3), dtype=np.uint8),
+                globalShifts=[(0, 0) for _ in range(20)],
+                shiftMagnitudes=[0.0 for _ in range(20)],
+                appliedGlobalShifts=[(0, 0) for _ in range(20)],
+                appliedShiftMagnitudes=[0.0 for _ in range(20)],
+                overflowFlags=[False for _ in range(20)],
+                alignmentApplied=False,
+            ),
+            frameFeatures=features,
+            preAlignmentRoiMotion=0.0,
+            postAlignmentRoiMotion=0.0,
+        )
+
+        report = gap_fill_scan_module._evaluate_threshold([cached_case], threshold=0.76)
+        case_result = report["cases"][0]
+
+        self.assertEqual(case_result["configSnapshotPath"], "recognition-config.snapshot.json")
+        self.assertEqual(case_result["gapFillPassCount"], 20)
+        self.assertEqual(case_result["hardGatePassCount"], 0)
+        self.assertEqual(case_result["candidateVisualState"], "no_splash")
 
 
 class VisualNotReadyMappingTests(unittest.TestCase):
@@ -989,7 +1111,7 @@ class RecognitionConfigOverrideTests(unittest.TestCase):
                     "sampleQualityMaxRecoveries": 3,
                 },
                 "nightIr": {
-                    "sampleQualityTimeoutMs": 5200,
+                    "sampleQualityTimeoutMs": 5700,
                     "sampleQualityMaxRecoveries": 3,
                 },
             },
@@ -997,8 +1119,31 @@ class RecognitionConfigOverrideTests(unittest.TestCase):
         )
 
         self.assertEqual(config.sceneMode, "night_ir")
-        self.assertEqual(config.sampleQualityTimeoutMs, 5200)
+        self.assertEqual(config.sampleQualityTimeoutMs, 5700)
         self.assertEqual(config.sampleQualityMaxRecoveries, 3)
+
+    def test_build_recognition_config_keeps_day_and_night_sample_quality_overrides_separate(self) -> None:
+        raw_config = {
+            "sceneMode": "auto",
+            "sampleQualityTimeoutMs": 4500,
+            "sampleQualityMaxRecoveries": 2,
+            "dayVisible": {
+                "sampleQualityTimeoutMs": 5200,
+                "sampleQualityMaxRecoveries": 3,
+            },
+            "nightIr": {
+                "sampleQualityTimeoutMs": 5700,
+                "sampleQualityMaxRecoveries": 3,
+            },
+        }
+
+        day_config = build_recognition_config(raw_config, "day_visible")
+        night_config = build_recognition_config(raw_config, "night_ir")
+
+        self.assertEqual(day_config.sampleQualityTimeoutMs, 5200)
+        self.assertEqual(day_config.sampleQualityMaxRecoveries, 3)
+        self.assertEqual(night_config.sampleQualityTimeoutMs, 5700)
+        self.assertEqual(night_config.sampleQualityMaxRecoveries, 3)
 
     def test_build_recognition_config_applies_day_sample_quality_overrides(self) -> None:
         config = build_recognition_config(
@@ -2110,7 +2255,7 @@ class RunOnceVisualReadinessTests(unittest.TestCase):
             roi={"x": 0, "y": 0, "width": 120, "height": 120},
         )
         sharp = _make_checkerboard_frame()
-        blurry = np.full_like(sharp, 127)
+        blurry = np.full((120, 160, 3), 127, dtype=np.uint8)
         readiness_outcome = VisualReadinessOutcome(
             metrics=VisualReadinessMetrics(ready=True, reason="visual_ready"),
             frames=[sharp.copy()],
@@ -2239,6 +2384,276 @@ class RunOnceVisualReadinessTests(unittest.TestCase):
         self.assertTrue(guard_result.passed)
         self.assertEqual(guard_result.metrics.reason, "sample_quality_recovered_and_passed")
         self.assertEqual(guard_result.metrics.recoveryCount, 3)
+
+    def test_sample_quality_guard_night_ir_5700_budget_recovers_two_late_focus_regressions(self) -> None:
+        target = RecognitionTarget(
+            deviceId="device",
+            channelId="0",
+            presetIndex=1,
+            presetName="preset",
+            targetId="target",
+            targetName="target",
+            roi={"x": 0, "y": 0, "width": 120, "height": 120},
+        )
+        sharp = _make_checkerboard_frame()
+        blurry = np.full_like(sharp, 127)
+        readiness_outcome = VisualReadinessOutcome(
+            metrics=VisualReadinessMetrics(ready=True, reason="visual_ready"),
+            frames=[sharp.copy()],
+            frameTimestampsMs=[0],
+            frameCapturedAts=[100.0],
+            streamType="flv",
+            streamUrl="fake://stream",
+            readyFrameIndex=0,
+            confirmFrameIndex=0,
+        )
+        frames = (
+            [sharp.copy() for _ in range(14)]
+            + [blurry.copy()]
+            + [sharp.copy() for _ in range(18)]
+            + [blurry.copy()]
+            + [sharp.copy() for _ in range(20)]
+        )
+
+        config_old = RecognitionGlobalConfig(
+            sceneMode="night_ir",
+            sampleDurationMs=2000,
+            sampleFps=10,
+            sequenceFrameCount=20,
+            visualReadinessMinSharpness=50.0,
+            visualReadinessMinSharpCellRatio=0.45,
+            sampleQualityTimeoutMs=5200,
+            sampleQualityMaxRecoveries=3,
+        )
+        service_old = RunOnceService(global_config=config_old, raw_config={"sceneMode": "night_ir"})
+        session_old = _FakeSession(frames, frame_interval_s=0.1)
+        session_old._base_time = 100.0
+        monotonic_old = [0.0] + [step * 0.1 for step in range(80)]
+        with patch("inspector.run_once_service.monotonic", side_effect=monotonic_old):
+            old_sequence, old_guard_result = service_old._sample_with_quality_guard(
+                session=session_old,
+                effective_config=config_old,
+                target=target,
+                readiness_outcome=readiness_outcome,
+            )
+
+        self.assertIsNone(old_sequence)
+        self.assertFalse(old_guard_result.passed)
+        self.assertEqual(old_guard_result.metrics.reason, "sample_quality_focus_regressed")
+        self.assertEqual(old_guard_result.metrics.rejectSharpnessCount, 2)
+        self.assertEqual(old_guard_result.metrics.rejectClearCellRatioCount, 2)
+
+        config_new = RecognitionGlobalConfig(
+            sceneMode="night_ir",
+            sampleDurationMs=2000,
+            sampleFps=10,
+            sequenceFrameCount=20,
+            visualReadinessMinSharpness=50.0,
+            visualReadinessMinSharpCellRatio=0.45,
+            sampleQualityTimeoutMs=5700,
+            sampleQualityMaxRecoveries=3,
+        )
+        service_new = RunOnceService(global_config=config_new, raw_config={"sceneMode": "night_ir"})
+        session_new = _FakeSession(frames, frame_interval_s=0.1)
+        session_new._base_time = 100.0
+        monotonic_new = [0.0] + [step * 0.1 for step in range(80)]
+        with patch("inspector.run_once_service.monotonic", side_effect=monotonic_new):
+            new_sequence, new_guard_result = service_new._sample_with_quality_guard(
+                session=session_new,
+                effective_config=config_new,
+                target=target,
+                readiness_outcome=readiness_outcome,
+            )
+
+        self.assertIsNotNone(new_sequence)
+        self.assertTrue(new_guard_result.passed)
+        self.assertEqual(new_guard_result.metrics.reason, "sample_quality_recovered_and_passed")
+        self.assertEqual(new_guard_result.metrics.recoveryCount, 2)
+        self.assertEqual(new_guard_result.metrics.rejectSharpnessCount, 2)
+        self.assertEqual(new_guard_result.metrics.rejectClearCellRatioCount, 2)
+        self.assertEqual(new_guard_result.metrics.rejectStabilityCount, 2)
+        self.assertIsNotNone(new_guard_result.metrics.firstRejectedSharpness)
+        self.assertIsNotNone(new_guard_result.metrics.lastRejectedSharpness)
+
+    def test_sample_quality_guard_night_ir_extended_budget_still_rejects_persistent_blur(self) -> None:
+        config = RecognitionGlobalConfig(
+            sceneMode="night_ir",
+            sampleDurationMs=2000,
+            sampleFps=10,
+            sequenceFrameCount=20,
+            visualReadinessMinSharpness=50.0,
+            visualReadinessMinSharpCellRatio=0.45,
+            sampleQualityTimeoutMs=5700,
+            sampleQualityMaxRecoveries=3,
+        )
+        service = RunOnceService(global_config=config, raw_config={"sceneMode": "night_ir"})
+        target = RecognitionTarget(
+            deviceId="device",
+            channelId="0",
+            presetIndex=1,
+            presetName="preset",
+            targetId="target",
+            targetName="target",
+            roi={"x": 0, "y": 0, "width": 120, "height": 120},
+        )
+        sharp = _make_checkerboard_frame()
+        blurry = np.full_like(sharp, 127)
+        readiness_outcome = VisualReadinessOutcome(
+            metrics=VisualReadinessMetrics(ready=True, reason="visual_ready"),
+            frames=[sharp.copy()],
+            frameTimestampsMs=[0],
+            frameCapturedAts=[100.0],
+            streamType="flv",
+            streamUrl="fake://stream",
+            readyFrameIndex=0,
+            confirmFrameIndex=0,
+        )
+        session = _FakeSession([blurry.copy() for _ in range(25)], frame_interval_s=0.1)
+        session._base_time = 100.0
+
+        sequence, guard_result = service._sample_with_quality_guard(
+            session=session,
+            effective_config=config,
+            target=target,
+            readiness_outcome=readiness_outcome,
+        )
+
+        self.assertIsNone(sequence)
+        self.assertFalse(guard_result.passed)
+        self.assertEqual(guard_result.metrics.reason, "sample_quality_blurry_after_ready")
+        self.assertGreaterEqual(guard_result.metrics.rejectSharpnessCount, 1)
+        self.assertGreaterEqual(guard_result.metrics.rejectClearCellRatioCount, 1)
+
+    def test_sample_quality_guard_records_diagnostics_when_first_sampling_frame_fails(self) -> None:
+        config = RecognitionGlobalConfig(
+            sceneMode="night_ir",
+            sampleDurationMs=400,
+            sampleFps=10,
+            sequenceFrameCount=4,
+            visualReadinessMinSharpness=50.0,
+            visualReadinessMinSharpCellRatio=0.45,
+            sampleQualityTimeoutMs=800,
+            sampleQualityMaxRecoveries=1,
+        )
+        service = RunOnceService(global_config=config, raw_config={"sceneMode": "night_ir"})
+        target = RecognitionTarget(
+            deviceId="device",
+            channelId="0",
+            presetIndex=1,
+            presetName="preset",
+            targetId="target",
+            targetName="target",
+            roi={"x": 0, "y": 0, "width": 120, "height": 120},
+        )
+        sharp = _make_checkerboard_frame()
+        blurry = np.full_like(sharp, 127)
+        readiness_outcome = VisualReadinessOutcome(
+            metrics=VisualReadinessMetrics(ready=True, reason="visual_ready"),
+            frames=[],
+            frameTimestampsMs=[],
+            frameCapturedAts=[],
+            streamType="flv",
+            streamUrl="fake://stream",
+            readyFrameIndex=None,
+            confirmFrameIndex=None,
+        )
+        session = _FakeSession([blurry.copy(), blurry.copy(), blurry.copy()], frame_interval_s=0.1)
+        session._base_time = 100.0
+
+        sequence, guard_result = service._sample_with_quality_guard(
+            session=session,
+            effective_config=config,
+            target=target,
+            readiness_outcome=readiness_outcome,
+        )
+
+        self.assertIsNone(sequence)
+        self.assertFalse(guard_result.passed)
+        self.assertEqual(guard_result.metrics.reason, "sample_quality_blurry_after_ready")
+        self.assertEqual(guard_result.metrics.rejectedFrames, 3)
+        self.assertGreaterEqual(guard_result.metrics.rejectSharpnessCount, 1)
+        self.assertGreaterEqual(guard_result.metrics.rejectClearCellRatioCount, 1)
+        self.assertIsNotNone(guard_result.metrics.firstRejectedFrameIndex)
+        self.assertIsNotNone(guard_result.metrics.lastRejectedFrameIndex)
+        self.assertIsNotNone(guard_result.degradedFrame)
+
+    def test_sample_quality_replay_metadata_contains_reject_diagnostics(self) -> None:
+        config = RecognitionGlobalConfig(sceneMode="night_ir", sampleQualityTimeoutMs=5700, sampleQualityMaxRecoveries=3)
+        service = RunOnceService(global_config=config, raw_config={"sceneMode": "night_ir"})
+        service.replay_store.persist_async = Mock(
+            return_value=({}, ReplaySaveState(status="pending", message="scheduled"))
+        )
+        target = RecognitionTarget(
+            deviceId="device",
+            channelId="0",
+            presetIndex=1,
+            presetName="preset",
+            targetId="target",
+            targetName="target",
+            roi={"x": 0, "y": 0, "width": 120, "height": 120},
+        )
+        frame = _make_checkerboard_frame()
+        guard_result = __import__("types").SimpleNamespace(
+            observedFrames=[frame.copy(), frame.copy()],
+            observedTimestampsMs=[0, 100],
+            streamType="flv",
+            streamUrl="fake://stream",
+            metrics=SampleQualityMetrics(
+                passed=False,
+                reason="sample_quality_focus_regressed",
+                rejectSharpnessCount=3,
+                rejectClearCellRatioCount=2,
+                rejectStabilityCount=1,
+                firstRejectedFrameIndex=4,
+                firstRejectedElapsedMs=420,
+                firstRejectedSharpness=43.0,
+                firstRejectedClearCellRatio=0.24,
+                firstRejectedStability=0.09,
+                lastRejectedFrameIndex=17,
+                lastRejectedElapsedMs=1980,
+                lastRejectedSharpness=47.0,
+                lastRejectedClearCellRatio=0.33,
+                lastRejectedStability=0.22,
+            ),
+            attemptStartFrame=frame.copy(),
+            degradedFrame=frame.copy(),
+            lastQualifiedFrame=frame.copy(),
+            acceptedMiddleFrame=None,
+            acceptedEndFrame=None,
+        )
+
+        service._persist_sample_quality_replay(
+            target=target,
+            guard_result=guard_result,
+            config_path="demo.json",
+            execution_result="sample_quality_timeout",
+            effective_config=config,
+            requested_scene_mode="night_ir",
+            effective_scene_mode="night_ir",
+            scene_mode_decision=None,
+            effective_scene_profile="night_ir",
+            twilight_profile_applied=None,
+            twilight_profile_reason=None,
+            twilight_brightness_mean=None,
+            focus_anchor_roi_fallback_used=False,
+            focus_anchor_roi_source="focus_anchor_roi",
+            stream_startup_freshness=None,
+            stream_startup_freshness_result=None,
+            scene_mode_stability=None,
+            scene_mode_stability_result=None,
+            visual_readiness=VisualReadinessMetrics(ready=True, reason="visual_ready"),
+            readiness_outcome=None,
+        )
+
+        extra_metadata = service.replay_store.persist_async.call_args.kwargs["extra_metadata"]
+        sample_quality_metadata = extra_metadata["sampleQuality"]
+        self.assertEqual(sample_quality_metadata["rejectSharpnessCount"], 3)
+        self.assertEqual(sample_quality_metadata["rejectClearCellRatioCount"], 2)
+        self.assertEqual(sample_quality_metadata["rejectStabilityCount"], 1)
+        self.assertEqual(sample_quality_metadata["firstRejectedFrameIndex"], 4)
+        self.assertEqual(sample_quality_metadata["lastRejectedFrameIndex"], 17)
+        self.assertEqual(extra_metadata["sampleQualityRejectSharpnessCount"], 3)
+        self.assertEqual(extra_metadata["sampleQualityLastRejectedStability"], 0.22)
 
     def test_sample_quality_guard_returns_degraded_after_recovery_budget_is_exhausted(self) -> None:
         config = RecognitionGlobalConfig(
@@ -2598,7 +3013,7 @@ class RunOnceVisualReadinessTests(unittest.TestCase):
                 },
                 "nightIr": {
                     "algorithmVersion": "test-night",
-                    "sampleQualityTimeoutMs": 5200,
+                    "sampleQualityTimeoutMs": 5700,
                     "sampleQualityMaxRecoveries": 3,
                     "visualReadinessMinSharpness": 90.0,
                     "visualReadinessNightPostReadyRecheckFrames": 2,
@@ -2644,7 +3059,7 @@ class RunOnceVisualReadinessTests(unittest.TestCase):
 
         def _fake_sample_quality_guard(*, session, effective_config, target, readiness_outcome, focus_anchor_roi):  # noqa: ANN001
             self.assertEqual(effective_config.sceneMode, "night_ir")
-            self.assertEqual(effective_config.sampleQualityTimeoutMs, 5200)
+            self.assertEqual(effective_config.sampleQualityTimeoutMs, 5700)
             self.assertEqual(effective_config.sampleQualityMaxRecoveries, 3)
             self.assertEqual(focus_anchor_roi.model_dump(), calibration.focusAnchorRoi)
             return None, __import__("types").SimpleNamespace(
@@ -2922,7 +3337,23 @@ class PseudoMultiPointRunnerTests(unittest.TestCase):
             visualReadiness=None,
             sampleQualityPassed=False,
             sampleQualityReason="sample_quality_timeout",
-            sampleQuality=SampleQualityMetrics(passed=False, reason="sample_quality_timeout"),
+            sampleQuality=SampleQualityMetrics(
+                passed=False,
+                reason="sample_quality_timeout",
+                rejectSharpnessCount=2,
+                rejectClearCellRatioCount=2,
+                rejectStabilityCount=1,
+                firstRejectedFrameIndex=6,
+                firstRejectedElapsedMs=720,
+                firstRejectedSharpness=44.0,
+                firstRejectedClearCellRatio=0.22,
+                firstRejectedStability=0.08,
+                lastRejectedFrameIndex=19,
+                lastRejectedElapsedMs=2120,
+                lastRejectedSharpness=48.0,
+                lastRejectedClearCellRatio=0.31,
+                lastRejectedStability=0.21,
+            ),
             scoreSummary=RecognitionScoreSummary(),
             evidencePaths=RecognitionEvidencePaths(
                 calibrationPath="demo.json",
@@ -2970,6 +3401,13 @@ class PseudoMultiPointRunnerTests(unittest.TestCase):
         self.assertTrue(rounds[0].streamStartupFreshnessStableAfterJump)
         self.assertEqual(rounds[0].streamStartupStartFrameTargetPath, "pending/stream-startup-start.ppm")
         self.assertEqual(rounds[0].streamStartupSettledFrameTargetPath, "pending/stream-startup-settled.ppm")
+        self.assertEqual(rounds[0].sampleQualityRejectSharpnessCount, 2)
+        self.assertEqual(rounds[0].sampleQualityRejectClearCellRatioCount, 2)
+        self.assertEqual(rounds[0].sampleQualityRejectStabilityCount, 1)
+        self.assertEqual(rounds[0].sampleQualityFirstRejectedFrameIndex, 6)
+        self.assertEqual(rounds[0].sampleQualityLastRejectedFrameIndex, 19)
+        self.assertEqual(rounds[0].sampleQualityFirstRejectedSharpness, 44.0)
+        self.assertEqual(rounds[0].sampleQualityLastRejectedStability, 0.21)
 
     def test_visual_not_ready_execution_maps_to_visual_readiness_failure_step(self) -> None:
         calibration_target = RecognitionTarget(

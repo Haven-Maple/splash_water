@@ -110,6 +110,23 @@ class _SampleQualityWindowRejectDetails:
 
 
 @dataclass(slots=True)
+class _SampleQualityRejectDiagnostics:
+    rejectSharpnessCount: int = 0
+    rejectClearCellRatioCount: int = 0
+    rejectStabilityCount: int = 0
+    firstRejectedFrameIndex: int | None = None
+    firstRejectedElapsedMs: int | None = None
+    firstRejectedSharpness: float | None = None
+    firstRejectedClearCellRatio: float | None = None
+    firstRejectedStability: float | None = None
+    lastRejectedFrameIndex: int | None = None
+    lastRejectedElapsedMs: int | None = None
+    lastRejectedSharpness: float | None = None
+    lastRejectedClearCellRatio: float | None = None
+    lastRejectedStability: float | None = None
+
+
+@dataclass(slots=True)
 class _SceneProfileSelection:
     effectiveConfig: RecognitionGlobalConfig
     effectiveSceneProfile: EffectiveSceneProfile
@@ -868,6 +885,45 @@ class RunOnceService:
                 "sampleQuality": sample_quality.model_dump() if sample_quality is not None else None,
                 "sampleQualityMaxRecoveriesConfigured": effective_pass.effectiveConfig.sampleQualityMaxRecoveries,
                 "sampleQualityRecoveryCountSemantics": self._sample_quality_recovery_count_semantics(),
+                "sampleQualityRejectSharpnessCount": (
+                    sample_quality.rejectSharpnessCount if sample_quality is not None else None
+                ),
+                "sampleQualityRejectClearCellRatioCount": (
+                    sample_quality.rejectClearCellRatioCount if sample_quality is not None else None
+                ),
+                "sampleQualityRejectStabilityCount": (
+                    sample_quality.rejectStabilityCount if sample_quality is not None else None
+                ),
+                "sampleQualityFirstRejectedFrameIndex": (
+                    sample_quality.firstRejectedFrameIndex if sample_quality is not None else None
+                ),
+                "sampleQualityFirstRejectedElapsedMs": (
+                    sample_quality.firstRejectedElapsedMs if sample_quality is not None else None
+                ),
+                "sampleQualityFirstRejectedSharpness": (
+                    sample_quality.firstRejectedSharpness if sample_quality is not None else None
+                ),
+                "sampleQualityFirstRejectedClearCellRatio": (
+                    sample_quality.firstRejectedClearCellRatio if sample_quality is not None else None
+                ),
+                "sampleQualityFirstRejectedStability": (
+                    sample_quality.firstRejectedStability if sample_quality is not None else None
+                ),
+                "sampleQualityLastRejectedFrameIndex": (
+                    sample_quality.lastRejectedFrameIndex if sample_quality is not None else None
+                ),
+                "sampleQualityLastRejectedElapsedMs": (
+                    sample_quality.lastRejectedElapsedMs if sample_quality is not None else None
+                ),
+                "sampleQualityLastRejectedSharpness": (
+                    sample_quality.lastRejectedSharpness if sample_quality is not None else None
+                ),
+                "sampleQualityLastRejectedClearCellRatio": (
+                    sample_quality.lastRejectedClearCellRatio if sample_quality is not None else None
+                ),
+                "sampleQualityLastRejectedStability": (
+                    sample_quality.lastRejectedStability if sample_quality is not None else None
+                ),
                 "streamReadFailureReason": (
                     sample_quality.streamReadFailureReason if sample_quality is not None else None
                 ),
@@ -1055,6 +1111,7 @@ class RunOnceService:
         sample_quality_session_reopened = False
         sample_quality_stream_retry_count = 0
         window_reject_details: _SampleQualityWindowRejectDetails | None = None
+        reject_diagnostics = _SampleQualityRejectDiagnostics()
 
         while monotonic() < deadline:
             frame_result: tuple[np.ndarray, float] | None
@@ -1188,6 +1245,19 @@ class RunOnceService:
                         elapsedMs=elapsed_ms,
                         sampleWindowMsActual=sampled_timestamps[-1] if sampled_timestamps else 0,
                         sampleWindowMaxAllowedMs=max_allowed_window_ms,
+                        rejectSharpnessCount=reject_diagnostics.rejectSharpnessCount,
+                        rejectClearCellRatioCount=reject_diagnostics.rejectClearCellRatioCount,
+                        rejectStabilityCount=reject_diagnostics.rejectStabilityCount,
+                        firstRejectedFrameIndex=reject_diagnostics.firstRejectedFrameIndex,
+                        firstRejectedElapsedMs=reject_diagnostics.firstRejectedElapsedMs,
+                        firstRejectedSharpness=reject_diagnostics.firstRejectedSharpness,
+                        firstRejectedClearCellRatio=reject_diagnostics.firstRejectedClearCellRatio,
+                        firstRejectedStability=reject_diagnostics.firstRejectedStability,
+                        lastRejectedFrameIndex=reject_diagnostics.lastRejectedFrameIndex,
+                        lastRejectedElapsedMs=reject_diagnostics.lastRejectedElapsedMs,
+                        lastRejectedSharpness=reject_diagnostics.lastRejectedSharpness,
+                        lastRejectedClearCellRatio=reject_diagnostics.lastRejectedClearCellRatio,
+                        lastRejectedStability=reject_diagnostics.lastRejectedStability,
                         streamReadFailureReason=stream_read_failure_reason,
                         streamReadFailureCount=stream_read_failure_count,
                         sampleQualityStreamRecovered=sample_quality_stream_retry_count > 0,
@@ -1215,6 +1285,15 @@ class RunOnceService:
                     )
                 continue
 
+            self._record_sample_quality_reject_diagnostics(
+                diagnostics=reject_diagnostics,
+                frame_stats=frame_stats,
+                effective_config=effective_config,
+                started_at=started_at,
+            )
+            rejected_frames += 1
+            if degraded_frame is None:
+                degraded_frame = frame.copy()
             if candidate_frames:
                 latest_failure_reason = self._sample_quality_failure_reason(
                     current_candidate_length=len(candidate_frames),
@@ -1223,9 +1302,6 @@ class RunOnceService:
                     max_recoveries=effective_config.sampleQualityMaxRecoveries,
                     timed_out=False,
                 )
-                rejected_frames += 1
-                if degraded_frame is None:
-                    degraded_frame = frame.copy()
                 recovery_count += 1
                 restarted_during_sampling = True
                 if recovery_count > effective_config.sampleQualityMaxRecoveries:
@@ -1264,6 +1340,19 @@ class RunOnceService:
             ),
             sampleWindowMaxAllowedMs=max_allowed_window_ms,
             lastFailureReason=latest_failure_reason,
+            rejectSharpnessCount=reject_diagnostics.rejectSharpnessCount,
+            rejectClearCellRatioCount=reject_diagnostics.rejectClearCellRatioCount,
+            rejectStabilityCount=reject_diagnostics.rejectStabilityCount,
+            firstRejectedFrameIndex=reject_diagnostics.firstRejectedFrameIndex,
+            firstRejectedElapsedMs=reject_diagnostics.firstRejectedElapsedMs,
+            firstRejectedSharpness=reject_diagnostics.firstRejectedSharpness,
+            firstRejectedClearCellRatio=reject_diagnostics.firstRejectedClearCellRatio,
+            firstRejectedStability=reject_diagnostics.firstRejectedStability,
+            lastRejectedFrameIndex=reject_diagnostics.lastRejectedFrameIndex,
+            lastRejectedElapsedMs=reject_diagnostics.lastRejectedElapsedMs,
+            lastRejectedSharpness=reject_diagnostics.lastRejectedSharpness,
+            lastRejectedClearCellRatio=reject_diagnostics.lastRejectedClearCellRatio,
+            lastRejectedStability=reject_diagnostics.lastRejectedStability,
             windowTooLongRejected=window_reject_details is not None,
             windowTooLongCandidateFrameCount=(
                 window_reject_details.candidateFrameCount if window_reject_details is not None else 0
@@ -1304,12 +1393,53 @@ class RunOnceService:
         frame_stats: FrameQualityEvaluation,
         effective_config: RecognitionGlobalConfig,
     ) -> bool:
-        stability_threshold = max(effective_config.visualReadinessMaxStabilityScore * 1.5, 0.18)
+        stability_threshold = RunOnceService._sample_quality_stability_threshold(effective_config)
         return (
             frame_stats.sharpness >= effective_config.visualReadinessMinSharpness
             and frame_stats.clearCellRatio >= effective_config.visualReadinessMinSharpCellRatio
             and frame_stats.stability <= stability_threshold
         )
+
+    @staticmethod
+    def _sample_quality_stability_threshold(effective_config: RecognitionGlobalConfig) -> float:
+        return max(effective_config.visualReadinessMaxStabilityScore * 1.5, 0.18)
+
+    @classmethod
+    def _record_sample_quality_reject_diagnostics(
+        cls,
+        *,
+        diagnostics: _SampleQualityRejectDiagnostics,
+        frame_stats: FrameQualityEvaluation,
+        effective_config: RecognitionGlobalConfig,
+        started_at: float,
+    ) -> None:
+        sharpness_failed = frame_stats.sharpness < effective_config.visualReadinessMinSharpness
+        clear_cell_failed = frame_stats.clearCellRatio < effective_config.visualReadinessMinSharpCellRatio
+        stability_failed = frame_stats.stability > cls._sample_quality_stability_threshold(effective_config)
+
+        if sharpness_failed:
+            diagnostics.rejectSharpnessCount += 1
+        if clear_cell_failed:
+            diagnostics.rejectClearCellRatioCount += 1
+        if stability_failed:
+            diagnostics.rejectStabilityCount += 1
+
+        if not (sharpness_failed or clear_cell_failed or stability_failed):
+            return
+
+        elapsed_ms = max(0, int(round((frame_stats.capturedAt - started_at) * 1000)))
+        if diagnostics.firstRejectedFrameIndex is None:
+            diagnostics.firstRejectedFrameIndex = frame_stats.frameIndex
+            diagnostics.firstRejectedElapsedMs = elapsed_ms
+            diagnostics.firstRejectedSharpness = frame_stats.sharpness
+            diagnostics.firstRejectedClearCellRatio = frame_stats.clearCellRatio
+            diagnostics.firstRejectedStability = frame_stats.stability
+
+        diagnostics.lastRejectedFrameIndex = frame_stats.frameIndex
+        diagnostics.lastRejectedElapsedMs = elapsed_ms
+        diagnostics.lastRejectedSharpness = frame_stats.sharpness
+        diagnostics.lastRejectedClearCellRatio = frame_stats.clearCellRatio
+        diagnostics.lastRejectedStability = frame_stats.stability
 
     @staticmethod
     def _sample_quality_max_allowed_window_ms(effective_config: RecognitionGlobalConfig) -> int:
@@ -1544,6 +1674,19 @@ class RunOnceService:
                 "sampleQualityPassed": False,
                 "sampleQualityReason": guard_result.metrics.reason,
                 "sampleQuality": guard_result.metrics.model_dump(),
+                "sampleQualityRejectSharpnessCount": guard_result.metrics.rejectSharpnessCount,
+                "sampleQualityRejectClearCellRatioCount": guard_result.metrics.rejectClearCellRatioCount,
+                "sampleQualityRejectStabilityCount": guard_result.metrics.rejectStabilityCount,
+                "sampleQualityFirstRejectedFrameIndex": guard_result.metrics.firstRejectedFrameIndex,
+                "sampleQualityFirstRejectedElapsedMs": guard_result.metrics.firstRejectedElapsedMs,
+                "sampleQualityFirstRejectedSharpness": guard_result.metrics.firstRejectedSharpness,
+                "sampleQualityFirstRejectedClearCellRatio": guard_result.metrics.firstRejectedClearCellRatio,
+                "sampleQualityFirstRejectedStability": guard_result.metrics.firstRejectedStability,
+                "sampleQualityLastRejectedFrameIndex": guard_result.metrics.lastRejectedFrameIndex,
+                "sampleQualityLastRejectedElapsedMs": guard_result.metrics.lastRejectedElapsedMs,
+                "sampleQualityLastRejectedSharpness": guard_result.metrics.lastRejectedSharpness,
+                "sampleQualityLastRejectedClearCellRatio": guard_result.metrics.lastRejectedClearCellRatio,
+                "sampleQualityLastRejectedStability": guard_result.metrics.lastRejectedStability,
                 "sampleQualityWindowMsActual": guard_result.metrics.sampleWindowMsActual,
                 "sampleQualityWindowMaxAllowedMs": guard_result.metrics.sampleWindowMaxAllowedMs,
                 "sampleQualityWindowTooLongRejected": guard_result.metrics.windowTooLongRejected,

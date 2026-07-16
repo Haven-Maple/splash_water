@@ -4,44 +4,88 @@
 
 ## 状态
 
-`night_ir` 是已验证可运行的基线，不是稳定验收结论。夜间摄像头必须固定为红外黑白成像；不支持采样期间在彩色与 IR 之间切换。
+`night_ir` 是当前已经验证可运行、可复盘的夜间识别基线，但还不能写成“彻底稳定验收完成”。
+
+- 摄像头前提：夜间必须固定红外黑白模式。
+- 不支持识别过程中在彩色与 IR 之间切换。
+- `focusAnchorRoi` 只服务于判稳与 sample-quality，识别仍只看 splash `roi`。
 
 ## 识别方向
 
-夜间水花以结构证据为主、弱动态证据为辅。真实水花应在识别 ROI 中呈现中央主亮团、足够中心覆盖与垂直展开，并填补桨叶之间的暗缝；单纯存在白色亮物不是水花证据。
+夜间水花以结构证据为主，以弱动态证据为辅。真实水花应在识别 ROI 中呈现：
 
-对焦锚点 ROI 仅用于视觉判稳和样本质量检查，不能替代识别 ROI。夜间识别 ROI 要为水花外扩和轻微目标位移保留边界余量。
+- 足够大的亮区主体
+- 足够的中心覆盖
+- 足够的纵向展开
+- 对暗缝有足够填充
 
-## 已验证阈值
+单纯存在亮物、白块或反光，不等于夜间水花。
 
-唯一可执行来源是 [backend/local_config.example.json](../backend/local_config.example.json)。当前验证过的关键夜间值如下：
+## 当前已冻结参数
 
-| 参数 | 值 |
+唯一可执行来源仍是 [backend/local_config.example.json](../backend/local_config.example.json)；本机 `backend/local_config.json` 只做本地覆盖。
+
+| 参数 | 当前值 |
 | --- | --- |
 | `visualReadinessMinSharpness` | `50.0` |
 | `visualReadinessMinSharpnessMargin` | `8.0` |
 | `visualReadinessNightPostReadyRecheckFrames` | `2` |
 | `visualReadinessNightPostReadyRecheckWindowMs` | `180` |
-| `sampleQualityTimeoutMs` | `5200` |
+| `sampleQualityTimeoutMs` | `5700` |
 | `sampleQualityMaxRecoveries` | `3` |
 | `hardGateMinLargestBrightComponentRatio` | `0.25` |
 | `hardGateMinCenterBrightCoverage` | `0.46` |
 | `hardGateMinVerticalSpreadRatio` | `0.55` |
 | `hardGateMinContinuousBrightRatio` | `0.60` |
-| `hardGateMinGapFillRatio` | `0.81` |
+| `hardGateMinGapFillRatio` | `0.76` |
 | `sequenceVoteThreshold` | `0.60` |
 
-`hardGateMinGapFillRatio=0.81` 来自同批夜间正负 replay 的离线扫描：更高值不能完整恢复真实水花，更低值没有额外安全收益。该结果曾在现场得到有水花 `10/10`、无水花 `10/10` 的回归支持。
+## 2026-07-15 gapFill 扫描结论
 
-## 已知边界
+2026-07-15 已完成一轮新的夜间 `gapFill` 离线扫描，使用样本：
 
-强制 IR 后仍出现过有水花 `6/10` 的回归，所有前置采样链均成功，失败集中在 `centerBrightCoverage` 硬门控。失败轮的 `centerBrightCoveragePassCount` 为 `1-3/20`，成功轮为 `13-20/20`。
+- 问题批次：`AB00A7DPAJ00124_1_p1_t3_has_splash_2026-07-15T14-20-49.632721+00-00`
+- 通过的夜间有水花基线：`AB00A7DPAJ00124_1_p1_t3_has_splash_2026-07-15T14-16-50.353115+00-00`
+- 通过的夜间无水花基线：
+  - `AB00A7DPAJ00124_1_p1_t3_no_splash_2026-07-15T14-13-08.289969+00-00`
+  - `AB00A7DPAJ00124_1_p1_t3_no_splash_2026-07-15T14-10-10.579672+00-00`
 
-因此下一项工作仅是以夜间正负 replay 离线扫描 `hardGateMinCenterBrightCoverage`，选取保持无水花拒绝能力的最高安全值，再回到现场验证。不得在该调查中同时调整 gap fill、时序投票或白天规则。
+粗扫 `0.81 -> 0.76` 与细扫 `0.780 -> 0.760` 结论一致：
+
+- `0.765` 仍不够，问题批次仍是 `18/19`，且 `round_07` 仍停在 `pass_ratio_middle_band`
+- `0.760` 是第一个同时满足：
+  - 有水花 `19/19`
+  - 无水花 `20/20`
+  的最高安全值
+
+因此本轮已将 `nightIr.hardGateMinGapFillRatio` 正式收敛到 `0.76`。
+
+扫描产物：
+
+- [night-ir-gap-fill-scan-2026-07-15.md](./night-ir-gap-fill-scan-2026-07-15.md)
+- [night-ir-gap-fill-scan-2026-07-15.json](./night-ir-gap-fill-scan-2026-07-15.json)
+- [night-ir-gap-fill-scan-2026-07-15-fine.json](./night-ir-gap-fill-scan-2026-07-15-fine.json)
+
+## 当前已知边界
+
+最新问题批次里要分成两类，不混调：
+
+- `round_05 / 07 / 10`：`gapFill` 假阴性，已通过新阈值 `0.76` 在离线扫描中恢复
+- `round_08`：`sample_quality_focus_regressed`，这是独立的对焦/样本质量问题，本轮不靠调 `gapFill` 去掩盖
+
+## 下一步
+
+下一步不是继续扫 `centerBrightCoverage`，而是：
+
+1. 现场重跑夜间 `has_splash 10` 轮
+2. 现场重跑夜间 `no_splash 10` 轮
+3. 继续单独观察 `sample_quality_focus_regressed`
+
+只有当 `sample_quality_focus_regressed` 在后续夜间测试里重复出现，才单独进入夜间焦点稳定性分析。
 
 ## 不在本基线内
 
-- 夜间全彩或 `night_visible` 识别。
-- 运行中 IR/彩色切换处理。
-- 依赖日夜参考图的构图守卫。
-- 以单个预置点为单位的专属夜间 splash 阈值。
+- `night_visible` 第三套识别 profile
+- 运行中 IR/彩色切换处理
+- 构图守卫
+- 按单个预置点维护专属夜间 splash 阈值
