@@ -79,6 +79,10 @@ class RecognitionGlobalConfig(BaseModel):
     nightBrightStdMultiplier: float = Field(default=0.6, ge=0)
     nightBrightMinThreshold: float = Field(default=96.0, ge=0, le=255)
     nightBrightBlurRadius: int = Field(default=1, ge=0, le=5)
+    nightRoiToleranceEnabled: bool = True
+    nightRoiToleranceOffsetRatio: float = Field(default=0.08, ge=0, le=0.25)
+    nightRoiToleranceExpandedScale: float = Field(default=1.1, ge=1.0, le=1.5)
+    nightRoiToleranceMaxFullCandidates: int = Field(default=3, ge=1, le=18)
     brightComponentMinAreaRatio: float = Field(default=0.003, gt=0, le=0.2)
     localMotionFeatureScale: float = Field(default=0.03, gt=0)
     dynamicAreaFeatureScale: float = Field(default=0.08, gt=0)

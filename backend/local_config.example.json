@@ -35,7 +35,7 @@
     "visualStableGraceThreshold": 8.0
   },
   "recognition_v1": {
-    "sceneMode": "auto",    //此参数为调节环境参数，固定测试白天用day_visible，固定测试夜晚红外用night_ir，auto为自动切换模式
+    "sceneMode": "auto",
     "sceneAutoFrameCount": 4,
     "sceneAutoCenterCropRatio": 0.6,
     "sceneAutoConfidenceThreshold": 0.68,
@@ -188,6 +188,10 @@
       "nightBrightStdMultiplier": 0.45,
       "nightBrightMinThreshold": 92,
       "nightBrightBlurRadius": 1,
+      "nightRoiToleranceEnabled": true,
+      "nightRoiToleranceOffsetRatio": 0.08,
+      "nightRoiToleranceExpandedScale": 1.1,
+      "nightRoiToleranceMaxFullCandidates": 3,
       "brightComponentMinAreaRatio": 0.002,
       "largestBrightComponentFeatureScale": 0.18,
       "continuousBrightFeatureScale": 0.8,

@@ -14,32 +14,32 @@ const grid: Array<Array<PtzAction | null>> = [
 ];
 
 const labelMap: Record<PtzAction, string> = {
-  up: "Up",
-  down: "Down",
-  left: "Left",
-  right: "Right",
-  upLeft: "Up Left",
-  upRight: "Up Right",
-  downLeft: "Down Left",
-  downRight: "Down Right",
-  zoomIn: "Zoom In",
-  zoomOut: "Zoom Out",
+  up: "上",
+  down: "下",
+  left: "左",
+  right: "右",
+  upLeft: "左上",
+  upRight: "右上",
+  downLeft: "左下",
+  downRight: "右下",
+  zoomIn: "放大",
+  zoomOut: "缩小",
 };
 
 const profileLabelMap: Record<StepProfile, string> = {
-  small: "Fine",
-  medium: "Standard",
-  large: "Large",
+  small: "微调",
+  medium: "标准",
+  large: "大步长",
 };
 
 export function PtzControlPanel({ stepProfile, disabled, onStepProfileChange, onMove }: PtzControlPanelProps) {
   return (
     <section className="panel">
       <div className="panelHeader">
-        <h2>Step 2 · PTZ Control</h2>
+        <h2>云台微调</h2>
       </div>
       <label>
-        <span>Move Step</span>
+        <span>移动步长</span>
         <select value={stepProfile} onChange={(event) => onStepProfileChange(event.target.value as StepProfile)}>
           {Object.entries(profileLabelMap).map(([value, label]) => (
             <option key={value} value={value}>
@@ -61,13 +61,12 @@ export function PtzControlPanel({ stepProfile, disabled, onStepProfileChange, on
       </div>
       <div className="buttonRow">
         <button type="button" disabled={disabled} onClick={() => onMove("zoomIn")}>
-          Zoom In
+          放大
         </button>
         <button type="button" disabled={disabled} onClick={() => onMove("zoomOut")}>
-          Zoom Out
+          缩小
         </button>
       </div>
     </section>
   );
 }
-

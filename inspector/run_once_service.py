@@ -42,6 +42,13 @@ from inspector.models import (
     StreamStartupFreshnessMetrics,
     VisualReadinessMetrics,
 )
+from inspector.roi_tolerance import (
+    RoiToleranceCandidate,
+    RoiToleranceSequenceMetrics,
+    generate_night_roi_candidates,
+    prefilter_night_roi_candidates,
+    select_sequence_candidate,
+)
 from inspector.replay_store import ReplayStore
 from inspector.scene_mode_resolver import SceneModeDecision, SceneModeResolver
 from inspector.scene_mode_stability import SceneModeStabilityGuard, SceneModeStabilityResult
@@ -55,6 +62,21 @@ class _DetectionPassResult:
     scoreSummary: RecognitionScoreSummary
     voteDecision: TemporalVoteDecision
     representativeIndex: int | None
+    detectionRoi: RoiModel
+    roiTolerance: "_RoiToleranceSelection | None" = None
+
+
+@dataclass(slots=True)
+class _RoiToleranceSelection:
+    enabled: bool
+    candidateCount: int
+    evaluatedCandidateCount: int
+    selectedCandidate: RoiToleranceCandidate
+    baseFramePassCount: int
+    selectedFramePassCount: int
+    rescued: bool
+    candidates: list[RoiToleranceCandidate]
+    candidateMetrics: dict[str, RoiToleranceSequenceMetrics]
 
 
 @dataclass(slots=True)
@@ -80,6 +102,9 @@ class _StreamStartupFreshnessResult:
     settledFrame: np.ndarray | None
     elapsedMs: int
     exitReason: str
+    streamReadFailureReason: str | None = None
+    streamReadFailureCount: int = 0
+    streamReadCallElapsedMs: int = 0
 
 
 @dataclass(slots=True)
@@ -277,6 +302,12 @@ class RunOnceService:
         focus_anchor_roi, focus_anchor_roi_source, focus_anchor_roi_fallback_used = self._focus_anchor_roi(target)
         replay_paths: dict[str, str] = {}
         replay_save = ReplaySaveState(status="disabled", message="Replay save not started")
+        pre_readiness_session_reopened = False
+        pre_readiness_stream_recovered = False
+        pre_readiness_stream_retry_count = 0
+        stream_read_failure_reason: str | None = None
+        stream_read_failure_count = 0
+        stream_read_call_elapsed_ms = 0
 
         try:
             session = self.sampler.open_session(device_id=record.deviceId, channel_id=record.channelId)
@@ -308,6 +339,58 @@ class RunOnceService:
         try:
             stream_startup_freshness_result = self._guard_stream_startup_freshness(session)
             stream_startup_freshness = self._stream_startup_freshness_metrics(stream_startup_freshness_result)
+            stream_read_failure_reason = self._stream_read_failure_reason(session)
+            stream_read_failure_count = self._stream_read_failure_count(session)
+            stream_read_call_elapsed_ms = self._stream_read_call_elapsed_ms(session)
+            if stream_read_failure_reason is not None:
+                pre_readiness_session_reopened = True
+                pre_readiness_stream_retry_count = 1
+                reopened_session, reopen_message = self._reopen_pre_readiness_session(session, target)
+                if reopened_session is None:
+                    return self._failure_result(
+                        config_path=config_path,
+                        requested_preset_index=requested_preset_index,
+                        execution_result=self._stream_failure_execution_result(stream_read_failure_reason),
+                        message=reopen_message or "FLV stream failed before visual readiness.",
+                        timing=timing,
+                        started_at=started_at,
+                        target=target,
+                        snapshot_path=record.snapshotPath,
+                        snapshot_url=record.snapshotUrl,
+                        stream_startup_freshness=stream_startup_freshness,
+                        pre_readiness_session_reopened=pre_readiness_session_reopened,
+                        pre_readiness_stream_recovered=False,
+                        pre_readiness_stream_retry_count=pre_readiness_stream_retry_count,
+                        stream_read_failure_reason=stream_read_failure_reason,
+                        stream_read_failure_count=stream_read_failure_count,
+                        stream_read_call_elapsed_ms=stream_read_call_elapsed_ms,
+                    )
+                session = reopened_session
+                stream_startup_freshness_result = self._guard_stream_startup_freshness(session)
+                stream_startup_freshness = self._stream_startup_freshness_metrics(stream_startup_freshness_result)
+                reopened_stream_failure_reason = self._stream_read_failure_reason(session)
+                reopened_stream_failure_count = self._stream_read_failure_count(session)
+                reopened_stream_read_call_elapsed_ms = self._stream_read_call_elapsed_ms(session)
+                if reopened_stream_failure_reason is not None:
+                    return self._failure_result(
+                        config_path=config_path,
+                        requested_preset_index=requested_preset_index,
+                        execution_result=self._stream_failure_execution_result(reopened_stream_failure_reason),
+                        message="FLV stream remained unavailable after the one pre-readiness reopen.",
+                        timing=timing,
+                        started_at=started_at,
+                        target=target,
+                        snapshot_path=record.snapshotPath,
+                        snapshot_url=record.snapshotUrl,
+                        stream_startup_freshness=stream_startup_freshness,
+                        pre_readiness_session_reopened=pre_readiness_session_reopened,
+                        pre_readiness_stream_recovered=False,
+                        pre_readiness_stream_retry_count=pre_readiness_stream_retry_count,
+                        stream_read_failure_reason=reopened_stream_failure_reason,
+                        stream_read_failure_count=reopened_stream_failure_count,
+                        stream_read_call_elapsed_ms=reopened_stream_read_call_elapsed_ms,
+                    )
+                pre_readiness_stream_recovered = True
             if self.global_config.visualReadinessEnabled:
                 visual_readiness_started = perf_counter()
                 readiness_context = self._resolve_visual_readiness_context(session)
@@ -319,6 +402,89 @@ class RunOnceService:
                 readiness_twilight_profile_applied = readiness_context.twilightProfileApplied
                 readiness_twilight_profile_reason = readiness_context.twilightProfileReason
                 readiness_twilight_brightness_mean = readiness_context.twilightBrightnessMean
+                stream_read_failure_reason = self._stream_read_failure_reason(session)
+                stream_read_failure_count = self._stream_read_failure_count(session)
+                stream_read_call_elapsed_ms = self._stream_read_call_elapsed_ms(session)
+                if stream_read_failure_reason is not None:
+                    if pre_readiness_stream_retry_count >= 1:
+                        return self._failure_result(
+                            config_path=config_path,
+                            requested_preset_index=requested_preset_index,
+                            execution_result=self._stream_failure_execution_result(stream_read_failure_reason),
+                            message="FLV stream failed during scene-mode preparation after the one pre-readiness reopen.",
+                            timing=timing,
+                            started_at=started_at,
+                            target=target,
+                            snapshot_path=record.snapshotPath,
+                            snapshot_url=record.snapshotUrl,
+                            stream_startup_freshness=stream_startup_freshness,
+                            scene_mode_stability=scene_mode_stability,
+                            pre_readiness_session_reopened=pre_readiness_session_reopened,
+                            pre_readiness_stream_recovered=False,
+                            pre_readiness_stream_retry_count=pre_readiness_stream_retry_count,
+                            stream_read_failure_reason=stream_read_failure_reason,
+                            stream_read_failure_count=stream_read_failure_count,
+                            stream_read_call_elapsed_ms=stream_read_call_elapsed_ms,
+                        )
+                    pre_readiness_session_reopened = True
+                    pre_readiness_stream_retry_count = 1
+                    reopened_session, reopen_message = self._reopen_pre_readiness_session(session, target)
+                    if reopened_session is None:
+                        return self._failure_result(
+                            config_path=config_path,
+                            requested_preset_index=requested_preset_index,
+                            execution_result=self._stream_failure_execution_result(stream_read_failure_reason),
+                            message=reopen_message or "FLV stream failed during scene-mode preparation.",
+                            timing=timing,
+                            started_at=started_at,
+                            target=target,
+                            snapshot_path=record.snapshotPath,
+                            snapshot_url=record.snapshotUrl,
+                            stream_startup_freshness=stream_startup_freshness,
+                            scene_mode_stability=scene_mode_stability,
+                            pre_readiness_session_reopened=pre_readiness_session_reopened,
+                            pre_readiness_stream_recovered=False,
+                            pre_readiness_stream_retry_count=pre_readiness_stream_retry_count,
+                            stream_read_failure_reason=stream_read_failure_reason,
+                            stream_read_failure_count=stream_read_failure_count,
+                            stream_read_call_elapsed_ms=stream_read_call_elapsed_ms,
+                        )
+                    session = reopened_session
+                    stream_startup_freshness_result = self._guard_stream_startup_freshness(session)
+                    stream_startup_freshness = self._stream_startup_freshness_metrics(stream_startup_freshness_result)
+                    readiness_context = self._resolve_visual_readiness_context(session)
+                    scene_mode_stability_result = readiness_context.sceneModeStabilityResult
+                    scene_mode_stability = self._scene_mode_stability_metrics(scene_mode_stability_result)
+                    readiness_scene_decision = readiness_context.sceneModeDecision
+                    readiness_effective_scene_mode = readiness_context.effectiveSceneMode
+                    readiness_effective_scene_profile = readiness_context.effectiveSceneProfile
+                    readiness_twilight_profile_applied = readiness_context.twilightProfileApplied
+                    readiness_twilight_profile_reason = readiness_context.twilightProfileReason
+                    readiness_twilight_brightness_mean = readiness_context.twilightBrightnessMean
+                    reopened_stream_failure_reason = self._stream_read_failure_reason(session)
+                    reopened_stream_failure_count = self._stream_read_failure_count(session)
+                    reopened_stream_read_call_elapsed_ms = self._stream_read_call_elapsed_ms(session)
+                    if reopened_stream_failure_reason is not None:
+                        return self._failure_result(
+                            config_path=config_path,
+                            requested_preset_index=requested_preset_index,
+                            execution_result=self._stream_failure_execution_result(reopened_stream_failure_reason),
+                            message="FLV stream remained unavailable after the one pre-readiness reopen.",
+                            timing=timing,
+                            started_at=started_at,
+                            target=target,
+                            snapshot_path=record.snapshotPath,
+                            snapshot_url=record.snapshotUrl,
+                            stream_startup_freshness=stream_startup_freshness,
+                            scene_mode_stability=scene_mode_stability,
+                            pre_readiness_session_reopened=pre_readiness_session_reopened,
+                            pre_readiness_stream_recovered=False,
+                            pre_readiness_stream_retry_count=pre_readiness_stream_retry_count,
+                            stream_read_failure_reason=reopened_stream_failure_reason,
+                            stream_read_failure_count=reopened_stream_failure_count,
+                            stream_read_call_elapsed_ms=reopened_stream_read_call_elapsed_ms,
+                        )
+                    pre_readiness_stream_recovered = True
                 if requested_scene_mode == "auto" and (
                     readiness_context.effectiveConfig is None
                     or (
@@ -380,6 +546,137 @@ class RunOnceService:
                 readiness_checker = VisualReadinessChecker(readiness_context.effectiveConfig)
                 readiness_outcome = readiness_checker.wait_until_ready(readiness_context.session, roi=focus_anchor_roi)
                 visual_readiness = readiness_outcome.metrics
+                stream_read_failure_reason = self._stream_read_failure_reason(session)
+                stream_read_failure_count = self._stream_read_failure_count(session)
+                stream_read_call_elapsed_ms = self._stream_read_call_elapsed_ms(session)
+                if stream_read_failure_reason is not None and not visual_readiness.ready:
+                    if pre_readiness_stream_retry_count >= 1:
+                        return self._failure_result(
+                            config_path=config_path,
+                            requested_preset_index=requested_preset_index,
+                            execution_result=self._stream_failure_execution_result(stream_read_failure_reason),
+                            message="FLV stream failed during visual readiness after the one pre-readiness reopen.",
+                            timing=timing,
+                            started_at=started_at,
+                            target=target,
+                            snapshot_path=record.snapshotPath,
+                            snapshot_url=record.snapshotUrl,
+                            stream_startup_freshness=stream_startup_freshness,
+                            scene_mode_stability=scene_mode_stability,
+                            visual_readiness=visual_readiness,
+                            pre_readiness_session_reopened=pre_readiness_session_reopened,
+                            pre_readiness_stream_recovered=False,
+                            pre_readiness_stream_retry_count=pre_readiness_stream_retry_count,
+                            stream_read_failure_reason=stream_read_failure_reason,
+                            stream_read_failure_count=stream_read_failure_count,
+                            stream_read_call_elapsed_ms=stream_read_call_elapsed_ms,
+                        )
+                    pre_readiness_session_reopened = True
+                    pre_readiness_stream_retry_count = 1
+                    reopened_session, reopen_message = self._reopen_pre_readiness_session(session, target)
+                    if reopened_session is None:
+                        return self._failure_result(
+                            config_path=config_path,
+                            requested_preset_index=requested_preset_index,
+                            execution_result=self._stream_failure_execution_result(stream_read_failure_reason),
+                            message=reopen_message or "FLV stream failed during visual readiness.",
+                            timing=timing,
+                            started_at=started_at,
+                            target=target,
+                            snapshot_path=record.snapshotPath,
+                            snapshot_url=record.snapshotUrl,
+                            stream_startup_freshness=stream_startup_freshness,
+                            scene_mode_stability=scene_mode_stability,
+                            visual_readiness=visual_readiness,
+                            pre_readiness_session_reopened=pre_readiness_session_reopened,
+                            pre_readiness_stream_recovered=False,
+                            pre_readiness_stream_retry_count=pre_readiness_stream_retry_count,
+                            stream_read_failure_reason=stream_read_failure_reason,
+                            stream_read_failure_count=stream_read_failure_count,
+                            stream_read_call_elapsed_ms=stream_read_call_elapsed_ms,
+                        )
+                    session = reopened_session
+                    stream_startup_freshness_result = self._guard_stream_startup_freshness(session)
+                    stream_startup_freshness = self._stream_startup_freshness_metrics(stream_startup_freshness_result)
+                    readiness_context = self._resolve_visual_readiness_context(session)
+                    scene_mode_stability_result = readiness_context.sceneModeStabilityResult
+                    scene_mode_stability = self._scene_mode_stability_metrics(scene_mode_stability_result)
+                    readiness_scene_decision = readiness_context.sceneModeDecision
+                    readiness_effective_scene_mode = readiness_context.effectiveSceneMode
+                    readiness_effective_scene_profile = readiness_context.effectiveSceneProfile
+                    readiness_twilight_profile_applied = readiness_context.twilightProfileApplied
+                    readiness_twilight_profile_reason = readiness_context.twilightProfileReason
+                    readiness_twilight_brightness_mean = readiness_context.twilightBrightnessMean
+                    reopened_stream_failure_reason = self._stream_read_failure_reason(session)
+                    reopened_stream_failure_count = self._stream_read_failure_count(session)
+                    reopened_stream_read_call_elapsed_ms = self._stream_read_call_elapsed_ms(session)
+                    if reopened_stream_failure_reason is not None:
+                        return self._failure_result(
+                            config_path=config_path,
+                            requested_preset_index=requested_preset_index,
+                            execution_result=self._stream_failure_execution_result(reopened_stream_failure_reason),
+                            message="FLV stream remained unavailable after the one pre-readiness reopen.",
+                            timing=timing,
+                            started_at=started_at,
+                            target=target,
+                            snapshot_path=record.snapshotPath,
+                            snapshot_url=record.snapshotUrl,
+                            stream_startup_freshness=stream_startup_freshness,
+                            scene_mode_stability=scene_mode_stability,
+                            pre_readiness_session_reopened=pre_readiness_session_reopened,
+                            pre_readiness_stream_recovered=False,
+                            pre_readiness_stream_retry_count=pre_readiness_stream_retry_count,
+                            stream_read_failure_reason=reopened_stream_failure_reason,
+                            stream_read_failure_count=reopened_stream_failure_count,
+                            stream_read_call_elapsed_ms=reopened_stream_read_call_elapsed_ms,
+                        )
+                    if readiness_context.effectiveConfig is None:
+                        return self._failure_result(
+                            config_path=config_path,
+                            requested_preset_index=requested_preset_index,
+                            execution_result=self._scene_mode_execution_result(
+                                scene_mode_stability_result.reason if scene_mode_stability_result is not None else None
+                            ),
+                            message="Scene mode did not settle after the pre-readiness stream reopen.",
+                            timing=timing,
+                            started_at=started_at,
+                            target=target,
+                            snapshot_path=record.snapshotPath,
+                            snapshot_url=record.snapshotUrl,
+                            stream_startup_freshness=stream_startup_freshness,
+                            scene_mode_stability=scene_mode_stability,
+                            pre_readiness_session_reopened=pre_readiness_session_reopened,
+                            pre_readiness_stream_recovered=True,
+                            pre_readiness_stream_retry_count=pre_readiness_stream_retry_count,
+                        )
+                    readiness_checker = VisualReadinessChecker(readiness_context.effectiveConfig)
+                    readiness_outcome = readiness_checker.wait_until_ready(session, roi=focus_anchor_roi)
+                    visual_readiness = readiness_outcome.metrics
+                    reopened_stream_failure_reason = self._stream_read_failure_reason(session)
+                    reopened_stream_failure_count = self._stream_read_failure_count(session)
+                    reopened_stream_read_call_elapsed_ms = self._stream_read_call_elapsed_ms(session)
+                    if reopened_stream_failure_reason is not None and not visual_readiness.ready:
+                        return self._failure_result(
+                            config_path=config_path,
+                            requested_preset_index=requested_preset_index,
+                            execution_result=self._stream_failure_execution_result(reopened_stream_failure_reason),
+                            message="FLV stream failed again during visual readiness after the one pre-readiness reopen.",
+                            timing=timing,
+                            started_at=started_at,
+                            target=target,
+                            snapshot_path=record.snapshotPath,
+                            snapshot_url=record.snapshotUrl,
+                            stream_startup_freshness=stream_startup_freshness,
+                            scene_mode_stability=scene_mode_stability,
+                            visual_readiness=visual_readiness,
+                            pre_readiness_session_reopened=pre_readiness_session_reopened,
+                            pre_readiness_stream_recovered=False,
+                            pre_readiness_stream_retry_count=pre_readiness_stream_retry_count,
+                            stream_read_failure_reason=reopened_stream_failure_reason,
+                            stream_read_failure_count=reopened_stream_failure_count,
+                            stream_read_call_elapsed_ms=reopened_stream_read_call_elapsed_ms,
+                        )
+                    pre_readiness_stream_recovered = True
                 if (
                     requested_scene_mode == "auto"
                     and visual_readiness.reason == "visual_not_ready_blurry"
@@ -838,6 +1135,8 @@ class RunOnceService:
             night_visual_state,
         )
 
+        roi_tolerance = effective_pass.roiTolerance
+
         replay_paths, replay_save = self.replay_store.persist_async(
             target=target,
             sequence=sequence,
@@ -869,6 +1168,12 @@ class RunOnceService:
                 "streamStartupFreshness": (
                     stream_startup_freshness.model_dump() if stream_startup_freshness is not None else None
                 ),
+                "preReadinessSessionReopened": pre_readiness_session_reopened,
+                "preReadinessStreamRecovered": pre_readiness_stream_recovered,
+                "preReadinessStreamRetryCount": pre_readiness_stream_retry_count,
+                "streamReadFailureReason": stream_read_failure_reason,
+                "streamReadFailureCount": stream_read_failure_count,
+                "streamReadCallElapsedMs": stream_read_call_elapsed_ms,
                 "sceneModeStability": (
                     scene_mode_stability.model_dump() if scene_mode_stability is not None else None
                 ),
@@ -876,6 +1181,58 @@ class RunOnceService:
                 "focusAnchorRoi": target.focusAnchorRoi.model_dump() if target.focusAnchorRoi is not None else None,
                 "focusAnchorRoiSource": focus_anchor_roi_source,
                 "focusAnchorRoiFallbackUsed": focus_anchor_roi_fallback_used,
+                "roiToleranceEnabled": roi_tolerance.enabled if roi_tolerance is not None else False,
+                "roiToleranceCandidateCount": roi_tolerance.candidateCount if roi_tolerance is not None else 0,
+                "roiToleranceEvaluatedCandidateCount": (
+                    roi_tolerance.evaluatedCandidateCount if roi_tolerance is not None else 0
+                ),
+                "roiToleranceSelectedRoi": (
+                    roi_tolerance.selectedCandidate.roi.model_dump()
+                    if roi_tolerance is not None and roi_tolerance.selectedCandidate.roi is not None
+                    else target.roi.model_dump()
+                ),
+                "roiToleranceSelectedOffsetXRatio": (
+                    roi_tolerance.selectedCandidate.offsetXRatio if roi_tolerance is not None else 0.0
+                ),
+                "roiToleranceSelectedOffsetYRatio": (
+                    roi_tolerance.selectedCandidate.offsetYRatio if roi_tolerance is not None else 0.0
+                ),
+                "roiToleranceSelectedScale": roi_tolerance.selectedCandidate.scale if roi_tolerance is not None else 1.0,
+                "roiToleranceBaseFramePassCount": roi_tolerance.baseFramePassCount if roi_tolerance is not None else None,
+                "roiToleranceSelectedFramePassCount": (
+                    roi_tolerance.selectedFramePassCount if roi_tolerance is not None else None
+                ),
+                "roiToleranceRescued": roi_tolerance.rescued if roi_tolerance is not None else False,
+                "roiToleranceCandidateMetrics": (
+                    {
+                        key: {
+                            "framePassCount": metrics.framePassCount,
+                            "hardGatePassCount": metrics.hardGatePassCount,
+                            "weightedFrameScoreMean": metrics.weightedFrameScoreMean,
+                            "dynamicEvidencePassCount": metrics.dynamicEvidencePassCount,
+                        }
+                        for key, metrics in roi_tolerance.candidateMetrics.items()
+                    }
+                    if roi_tolerance is not None
+                    else None
+                ),
+                "roiToleranceCandidates": (
+                    [
+                        {
+                            "key": candidate.key,
+                            "roi": candidate.roi.model_dump() if candidate.roi is not None else None,
+                            "offsetXRatio": candidate.offsetXRatio,
+                            "offsetYRatio": candidate.offsetYRatio,
+                            "scale": candidate.scale,
+                            "isBase": candidate.isBase,
+                            "skipReason": candidate.skipReason,
+                        }
+                        for candidate in roi_tolerance.candidates
+                    ]
+                    if roi_tolerance is not None
+                    else None
+                ),
+                "roiToleranceSelectedFrameIndex": effective_pass.representativeIndex,
                 "twilightProfileApplied": twilight_profile_applied,
                 "twilightProfileReason": twilight_profile_reason,
                 "twilightBrightnessMean": twilight_brightness_mean,
@@ -1027,6 +1384,32 @@ class RunOnceService:
             sampleQualityMaxRecoveriesConfigured=effective_pass.effectiveConfig.sampleQualityMaxRecoveries,
             sampleQualityRecoveryCountSemantics=self._sample_quality_recovery_count_semantics(),
             sampleQuality=sample_quality,
+            preReadinessSessionReopened=pre_readiness_session_reopened,
+            preReadinessStreamRecovered=pre_readiness_stream_recovered,
+            preReadinessStreamRetryCount=pre_readiness_stream_retry_count,
+            streamReadFailureReason=stream_read_failure_reason,
+            streamReadFailureCount=stream_read_failure_count,
+            streamReadCallElapsedMs=stream_read_call_elapsed_ms,
+            roiToleranceEnabled=roi_tolerance.enabled if roi_tolerance is not None else False,
+            roiToleranceCandidateCount=roi_tolerance.candidateCount if roi_tolerance is not None else 0,
+            roiToleranceEvaluatedCandidateCount=(
+                roi_tolerance.evaluatedCandidateCount if roi_tolerance is not None else 0
+            ),
+            roiToleranceSelectedRoi=(
+                roi_tolerance.selectedCandidate.roi if roi_tolerance is not None else target.roi
+            ),
+            roiToleranceSelectedOffsetXRatio=(
+                roi_tolerance.selectedCandidate.offsetXRatio if roi_tolerance is not None else 0.0
+            ),
+            roiToleranceSelectedOffsetYRatio=(
+                roi_tolerance.selectedCandidate.offsetYRatio if roi_tolerance is not None else 0.0
+            ),
+            roiToleranceSelectedScale=(roi_tolerance.selectedCandidate.scale if roi_tolerance is not None else 1.0),
+            roiToleranceBaseFramePassCount=(roi_tolerance.baseFramePassCount if roi_tolerance is not None else None),
+            roiToleranceSelectedFramePassCount=(
+                roi_tolerance.selectedFramePassCount if roi_tolerance is not None else None
+            ),
+            roiToleranceRescued=(roi_tolerance.rescued if roi_tolerance is not None else False),
             scoreSummary=effective_pass.scoreSummary,
             evidencePaths=RecognitionEvidencePaths(
                 calibrationPath=str(config_path),
@@ -1039,6 +1422,7 @@ class RunOnceService:
                 sceneProbeStartFramePath=replay_paths.get("sceneProbeStartFramePath"),
                 sceneProbeEndFramePath=replay_paths.get("sceneProbeEndFramePath"),
                 representativeFramePath=replay_paths.get("representativeFramePath"),
+                roiToleranceSelectedFramePath=replay_paths.get("roiToleranceSelectedFramePath"),
                 visualReadinessStartFramePath=replay_paths.get("visualReadinessStartFramePath"),
                 visualReadinessReadyFramePath=replay_paths.get("visualReadinessReadyFramePath"),
                 visualReadinessConfirmFramePath=replay_paths.get("visualReadinessConfirmFramePath"),
@@ -1810,6 +2194,9 @@ class RunOnceService:
             jumpDetected=freshness_result.jumpDetected,
             stableAfterJump=freshness_result.stableAfterJump,
             exitReason=freshness_result.exitReason,
+            streamReadFailureReason=freshness_result.streamReadFailureReason,
+            streamReadFailureCount=freshness_result.streamReadFailureCount,
+            streamReadCallElapsedMs=freshness_result.streamReadCallElapsedMs,
         )
 
     def _guard_stream_startup_freshness(self, session: object) -> _StreamStartupFreshnessResult:
@@ -1899,7 +2286,47 @@ class RunOnceService:
             settledFrame=settled_frame,
             elapsedMs=elapsed_ms,
             exitReason=exit_reason,
+            streamReadFailureReason=self._stream_read_failure_reason(session),
+            streamReadFailureCount=self._stream_read_failure_count(session),
+            streamReadCallElapsedMs=self._stream_read_call_elapsed_ms(session),
         )
+
+    def _reopen_pre_readiness_session(
+        self,
+        session: object,
+        target: RecognitionTarget,
+    ) -> tuple[object | None, str | None]:
+        try:
+            session.release()
+        except Exception:
+            logger.debug("Ignoring FLV session release failure during pre-readiness reopen", exc_info=True)
+        try:
+            reopened = self.sampler.open_session(device_id=target.deviceId, channel_id=target.channelId)
+        except FlvSamplerError as error:
+            logger.warning("Pre-readiness FLV reopen failed for %s/%s: %s", target.deviceId, target.channelId, error)
+            return None, str(error)
+        except Exception as error:
+            logger.warning("Unexpected pre-readiness FLV reopen failure for %s/%s: %s", target.deviceId, target.channelId, error)
+            return None, f"Unexpected FLV reopen error: {error}"
+        logger.info("Pre-readiness FLV session reopened for %s/%s", target.deviceId, target.channelId)
+        return reopened, None
+
+    @staticmethod
+    def _stream_read_failure_reason(session: object) -> str | None:
+        reason = getattr(session, "lastReadFailureReason", None)
+        return reason if reason in {"stream_read_timeout", "stream_eof", "stream_read_failed"} else None
+
+    @staticmethod
+    def _stream_read_failure_count(session: object) -> int:
+        return max(0, int(getattr(session, "lastReadFailureCount", 0) or 0))
+
+    @staticmethod
+    def _stream_read_call_elapsed_ms(session: object) -> int:
+        return max(0, int(getattr(session, "lastReadCallElapsedMs", 0) or 0))
+
+    @staticmethod
+    def _stream_failure_execution_result(reason: str | None) -> ExecutionResult:
+        return "stream_read_timeout" if reason == "stream_read_timeout" else "stream_failed"
 
     def _config_for_scene_mode(self, scene_mode: ResolvedSceneMode) -> RecognitionGlobalConfig:
         return build_recognition_config(self.raw_config, scene_mode)
@@ -2184,15 +2611,93 @@ class RunOnceService:
         effective_config: RecognitionGlobalConfig,
     ) -> _DetectionPassResult:
         aligner = FullFrameAligner(effective_config)
+        aligned_sequence = aligner.align(sequence)
+        base_pass = self._evaluate_detection_roi(
+            sequence=sequence,
+            aligned_sequence=aligned_sequence,
+            roi=target.roi,
+            effective_config=effective_config,
+        )
+        if effective_config.sceneMode != "night_ir" or not effective_config.nightRoiToleranceEnabled:
+            return base_pass
+
+        candidates = generate_night_roi_candidates(
+            target.roi,
+            frame_width=sequence.frameWidth,
+            frame_height=sequence.frameHeight,
+            offset_ratios=(
+                -effective_config.nightRoiToleranceOffsetRatio,
+                0.0,
+                effective_config.nightRoiToleranceOffsetRatio,
+            ),
+            scales=(1.0, effective_config.nightRoiToleranceExpandedScale),
+        )
+        evaluated_passes: dict[str, _DetectionPassResult] = {}
+        candidate_metrics: dict[str, RoiToleranceSequenceMetrics] = {}
+        base_candidate = next(candidate for candidate in candidates if candidate.isBase)
+        evaluated_candidates = [base_candidate]
+        if base_pass.voteDecision.visualState != "has_splash":
+            evaluated_candidates, _ = prefilter_night_roi_candidates(
+                candidates,
+                aligned_sequence.alignedFrames,
+                effective_config,
+                max_full_candidates=effective_config.nightRoiToleranceMaxFullCandidates,
+            )
+        for candidate in evaluated_candidates:
+            candidate_pass = (
+                base_pass
+                if candidate.isBase
+                else self._evaluate_detection_roi(
+                    sequence=sequence,
+                    aligned_sequence=aligned_sequence,
+                    roi=candidate.roi,
+                    effective_config=effective_config,
+                )
+            )
+            evaluated_passes[candidate.key] = candidate_pass
+            candidate_metrics[candidate.key] = RoiToleranceSequenceMetrics(
+                framePassCount=candidate_pass.scoreSummary.framePassCount or 0,
+                hardGatePassCount=candidate_pass.scoreSummary.hardGatePassCount or 0,
+                weightedFrameScoreMean=candidate_pass.scoreSummary.weightedFrameScoreMean or 0.0,
+                dynamicEvidencePassCount=candidate_pass.scoreSummary.dynamicEvidencePassCount or 0,
+            )
+
+        selected_candidate = select_sequence_candidate(candidates, candidate_metrics)
+        selected_pass = evaluated_passes[selected_candidate.key]
+        base_metrics = candidate_metrics[base_candidate.key]
+        selected_metrics = candidate_metrics[selected_candidate.key]
+        selected_pass.roiTolerance = _RoiToleranceSelection(
+            enabled=True,
+            candidateCount=len(candidates),
+            evaluatedCandidateCount=len(evaluated_candidates),
+            selectedCandidate=selected_candidate,
+            baseFramePassCount=base_metrics.framePassCount,
+            selectedFramePassCount=selected_metrics.framePassCount,
+            rescued=(
+                not selected_candidate.isBase
+                and selected_pass.voteDecision.visualState == "has_splash"
+                and base_pass.voteDecision.visualState != "has_splash"
+            ),
+            candidates=candidates,
+            candidateMetrics=candidate_metrics,
+        )
+        return selected_pass
+
+    def _evaluate_detection_roi(
+        self,
+        *,
+        sequence: SampledSequence,
+        aligned_sequence: AlignedSequence,
+        roi: RoiModel,
+        effective_config: RecognitionGlobalConfig,
+    ) -> _DetectionPassResult:
         feature_extractor = FrameFeatureExtractor(effective_config)
         frame_scorer = WeightedFrameScorer(effective_config)
         vote_resolver = TemporalVoteResolver(effective_config)
-
-        aligned_sequence = aligner.align(sequence)
-        frame_features = feature_extractor.extract(aligned_sequence.alignedFrames, target.roi)
+        frame_features = feature_extractor.extract(aligned_sequence.alignedFrames, roi)
         frame_scores = frame_scorer.score(frame_features)
-        pre_alignment_roi_motion = mean_roi_motion(sequence.frames, target.roi)
-        post_alignment_roi_motion = mean_roi_motion(aligned_sequence.alignedFrames, target.roi)
+        pre_alignment_roi_motion = mean_roi_motion(sequence.frames, roi)
+        post_alignment_roi_motion = mean_roi_motion(aligned_sequence.alignedFrames, roi)
         representative_index = max(frame_scores, key=lambda item: item.weightedScore).frameIndex if frame_scores else None
         score_summary = self._score_summary(
             effective_config=effective_config,
@@ -2215,6 +2720,7 @@ class RunOnceService:
             scoreSummary=score_summary,
             voteDecision=vote_decision,
             representativeIndex=representative_index,
+            detectionRoi=roi,
         )
 
     def _score_summary(
@@ -2482,6 +2988,12 @@ class RunOnceService:
         focus_anchor_roi_fallback_used: bool | None = None,
         focus_anchor_roi_source: str | None = None,
         effective_config: RecognitionGlobalConfig | None = None,
+        pre_readiness_session_reopened: bool = False,
+        pre_readiness_stream_recovered: bool = False,
+        pre_readiness_stream_retry_count: int = 0,
+        stream_read_failure_reason: str | None = None,
+        stream_read_failure_count: int = 0,
+        stream_read_call_elapsed_ms: int = 0,
     ) -> RecognitionRunResult:
         timing.totalMs = self._elapsed_ms(started_at)
         fallback_target = target or RecognitionTarget(
@@ -2532,6 +3044,12 @@ class RunOnceService:
             sampleQualityMaxRecoveriesConfigured=effective_config.sampleQualityMaxRecoveries,
             sampleQualityRecoveryCountSemantics=self._sample_quality_recovery_count_semantics(),
             sampleQuality=sample_quality,
+            preReadinessSessionReopened=pre_readiness_session_reopened,
+            preReadinessStreamRecovered=pre_readiness_stream_recovered,
+            preReadinessStreamRetryCount=pre_readiness_stream_retry_count,
+            streamReadFailureReason=stream_read_failure_reason,
+            streamReadFailureCount=stream_read_failure_count,
+            streamReadCallElapsedMs=stream_read_call_elapsed_ms,
             scoreSummary=self._score_summary(effective_config=effective_config),
             evidencePaths=RecognitionEvidencePaths(
                 calibrationPath=str(config_path),

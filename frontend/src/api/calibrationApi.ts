@@ -1,7 +1,10 @@
-import { getJson, postJson } from "./http";
+import { API_BASE_URL, getJson, postJson } from "./http";
 import type {
   CalibrationDraft,
+  CalibrationHistoryItem,
+  CalibrationListItem,
   CalibrationOperationResponse,
+  CalibrationRecord,
   CalibrationToolRuntimeConfig,
 } from "../types/calibration";
 
@@ -23,10 +26,36 @@ export function getCalibrationToolRuntimeConfig(): Promise<CalibrationToolRuntim
   return getJson<CalibrationToolRuntimeConfig>("/api/calibration/runtime-config");
 }
 
-export function saveCalibration(payload: CalibrationDraft): Promise<CalibrationOperationResponse> {
+export function saveCalibration(
+  payload: CalibrationDraft & { snapshotOriginalBase64?: string | null; snapshotAnnotatedBase64?: string | null },
+): Promise<CalibrationOperationResponse> {
   const missing = validateCalibrationDraft(payload);
   if (missing.length > 0) {
     throw new Error(`Missing required calibration fields: ${missing.join(", ")}`);
   }
   return postJson<CalibrationOperationResponse>("/api/calibration/save", payload);
+}
+
+export function getCalibration(deviceId: string, presetIndex: number): Promise<CalibrationRecord> {
+  return getJson<CalibrationRecord>(`/api/calibration/get?deviceId=${encodeURIComponent(deviceId)}&presetIndex=${presetIndex}`);
+}
+
+export async function listCalibrations(): Promise<CalibrationListItem[]> {
+  const result = await getJson<{ items: CalibrationListItem[] }>("/api/calibration/list");
+  return result.items;
+}
+
+export async function getCalibrationHistory(deviceId: string, presetIndex: number): Promise<CalibrationHistoryItem[]> {
+  const result = await getJson<{ items: CalibrationHistoryItem[] }>(
+    `/api/calibration/history?deviceId=${encodeURIComponent(deviceId)}&presetIndex=${presetIndex}`,
+  );
+  return result.items;
+}
+
+export function restoreCalibration(deviceId: string, presetIndex: number, version: number): Promise<CalibrationOperationResponse> {
+  return postJson<CalibrationOperationResponse>("/api/calibration/restore", { deviceId, presetIndex, version });
+}
+
+export function downloadCalibrationExport(path: string) {
+  window.open(`${API_BASE_URL}${path}`, "_blank", "noopener,noreferrer");
 }

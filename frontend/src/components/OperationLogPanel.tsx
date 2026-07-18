@@ -18,16 +18,16 @@ export function OperationLogPanel({ activityLogs, vendorLogs, onRefreshVendorLog
   return (
     <section className="panel">
       <div className="panelHeader">
-        <h2>Operation Logs</h2>
+        <h2>诊断信息</h2>
         <button type="button" disabled={loading} onClick={onRefreshVendorLogs} className="ghostButton">
-          Refresh Vendor Logs
+          刷新后端日志
         </button>
       </div>
       <div className="logsGrid">
         <div>
-          <h3 className="subheading">Page Activity</h3>
+          <h3 className="subheading">页面操作</h3>
           <div className="logList">
-            {activityLogs.length === 0 ? <div className="emptySmall">No page activity yet.</div> : null}
+            {activityLogs.length === 0 ? <div className="emptySmall">暂无页面操作记录。</div> : null}
             {activityLogs.map((item) => (
               <div key={item.id} className={`logItem ${item.level === "error" ? "logItemError" : ""}`}>
                 <div className="logTimestamp">{item.timestamp}</div>
@@ -37,14 +37,14 @@ export function OperationLogPanel({ activityLogs, vendorLogs, onRefreshVendorLog
           </div>
         </div>
         <div>
-          <h3 className="subheading">Recent Backend Logs</h3>
+          <h3 className="subheading">最近后端日志</h3>
           <div className="logList">
-            {vendorLogs.length === 0 ? <div className="emptySmall">No backend logs loaded.</div> : null}
+            {vendorLogs.length === 0 ? <div className="emptySmall">尚未加载后端日志。</div> : null}
             {vendorLogs.map((item) => (
               <div key={`${item.traceId}-${item.timestamp}`} className={`logItem ${item.success ? "" : "logItemError"}`}>
                 <div className="logTimestamp">{item.timestamp}</div>
                 <div>{item.localEndpoint}</div>
-                <div className="metaText">{item.success ? "success" : item.error ?? "failed"}</div>
+                <div className="metaText">{item.success ? "成功" : item.error ?? "失败"}</div>
               </div>
             ))}
           </div>
@@ -53,4 +53,3 @@ export function OperationLogPanel({ activityLogs, vendorLogs, onRefreshVendorLog
     </section>
   );
 }
-

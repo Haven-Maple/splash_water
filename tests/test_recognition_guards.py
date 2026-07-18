@@ -1,21 +1,23 @@
 from __future__ import annotations
 
 import io
+import json
 import sys
 import tempfile
 import types
 import unittest
 from pathlib import Path
 from contextlib import redirect_stderr
-from time import monotonic
+from time import monotonic, perf_counter
 from unittest.mock import Mock, PropertyMock, patch
 
 import numpy as np
 
 import inspector.flv_sampler as flv_sampler_module
 import inspector.night_ir_gap_fill_scan as gap_fill_scan_module
+from app.schemas.calibration import RoiModel
 from inspector.config import RecognitionGlobalConfig, build_recognition_config
-from inspector.flv_sampler import FlvSamplerError, FlvStreamSession
+from inspector.flv_sampler import FlvSamplerError, FlvSequenceSampler, FlvStreamSession
 from inspector.frame_scoring import WeightedFrameScorer
 from inspector.models import (
     AlignedSequence,
@@ -37,10 +39,17 @@ from inspector.pseudo_multi_point_test import (
     PseudoMultiPointRuntimeConfig,
     PseudoMultiPointRunner,
     PseudoMultiPointSummary,
+    TransitionPresetStepResult,
     build_summary,
+    emit_round_progress,
 )
 from inspector.replay_store import ReplayStore
 from inspector.run_once_service import RunOnceService
+from inspector.roi_tolerance import (
+    RoiToleranceSequenceMetrics,
+    generate_night_roi_candidates,
+    select_sequence_candidate,
+)
 from inspector.scene_mode_resolver import SceneModeDecision
 from inspector.scene_mode_stability import SceneModeStabilityGuard, SceneModeStabilityResult, SceneModeStabilityWindow
 from inspector.temporal_voting import TemporalVoteResolver
@@ -148,6 +157,219 @@ def _make_single_edge_frame(size: tuple[int, int] = (120, 160)) -> np.ndarray:
     return frame
 
 
+class NightRoiToleranceTests(unittest.TestCase):
+    @staticmethod
+    def _sequence() -> SampledSequence:
+        frame = np.zeros((120, 160, 3), dtype=np.uint8)
+        return SampledSequence(
+            streamType="flv",
+            streamUrl="fake://stream",
+            frames=np.stack([frame] * 20),
+            frameTimestampsMs=[index * 100 for index in range(20)],
+            targetFrameCount=20,
+            sampledFrameCount=20,
+            configuredSampleFps=10,
+            actualSampleFps=10.0,
+            configuredSampleDurationMs=2000,
+            actualSampleDurationMs=1900,
+            frameWidth=160,
+            frameHeight=120,
+        )
+
+    @staticmethod
+    def _feature(frame_index: int, *, center_coverage: float) -> FrameFeature:
+        return FrameFeature(
+            frameIndex=frame_index,
+            brightThreshold=120.0,
+            roiBrightnessQ99=220.0,
+            roiBrightnessMax=255.0,
+            localResidualMotion=0.08,
+            dynamicAreaRatio=0.2,
+            highlightDisturbance=0.08,
+            largestBrightComponentRatio=0.5,
+            brightComponentCount=1,
+            fragmentationScore=0.05,
+            centerBrightCoverage=center_coverage,
+            upperHalfBrightRatio=0.3,
+            lowerHalfBrightRatio=0.3,
+            verticalSpreadRatio=0.6,
+            gapFillRatio=0.9,
+            temporalAreaVariance=0.2,
+            temporalShapeVariance=0.4,
+        )
+
+    def test_candidates_cover_offsets_and_scale_with_base_first(self) -> None:
+        base_roi = RoiModel(x=50, y=40, width=104, height=64)
+
+        candidates = generate_night_roi_candidates(base_roi, frame_width=320, frame_height=240)
+
+        self.assertEqual(len(candidates), 18)
+        self.assertTrue(candidates[0].isBase)
+        self.assertEqual(candidates[0].roi, base_roi)
+        shifted = next(
+            item for item in candidates
+            if item.offsetXRatio == 0.08 and item.offsetYRatio == 0.08 and item.scale == 1.0
+        )
+        self.assertEqual(shifted.roi, RoiModel(x=58, y=45, width=104, height=64))
+        expanded = next(
+            item for item in candidates
+            if item.offsetXRatio == 0.0 and item.offsetYRatio == 0.0 and item.scale == 1.1
+        )
+        self.assertEqual(expanded.roi, RoiModel(x=45, y=37, width=114, height=70))
+
+    def test_out_of_bounds_variants_are_skipped_without_resizing_base_roi(self) -> None:
+        base_roi = RoiModel(x=0, y=0, width=40, height=30)
+
+        candidates = generate_night_roi_candidates(base_roi, frame_width=100, frame_height=80)
+
+        self.assertEqual(candidates[0].roi, base_roi)
+        self.assertTrue(any(item.skipReason == "out_of_bounds" for item in candidates[1:]))
+        self.assertTrue(all(item.roi is None or item.roi.width in {40, 44} for item in candidates))
+
+    def test_sequence_selection_prefers_base_on_exact_tie(self) -> None:
+        candidates = generate_night_roi_candidates(RoiModel(x=30, y=30, width=40, height=30), 160, 120)
+        metrics = {
+            item.key: RoiToleranceSequenceMetrics(
+                framePassCount=12,
+                hardGatePassCount=12,
+                weightedFrameScoreMean=0.8,
+                dynamicEvidencePassCount=14,
+            )
+            for item in candidates
+            if item.roi is not None
+        }
+
+        selected = select_sequence_candidate(candidates, metrics)
+
+        self.assertTrue(selected.isBase)
+
+    def test_sequence_selection_uses_complete_window_not_per_frame_combination(self) -> None:
+        candidates = generate_night_roi_candidates(RoiModel(x=30, y=30, width=40, height=30), 160, 120)
+        base = candidates[0]
+        shifted = next(item for item in candidates if item.roi is not None and not item.isBase)
+        metrics = {
+            base.key: RoiToleranceSequenceMetrics(9, 12, 0.95, 18),
+            shifted.key: RoiToleranceSequenceMetrics(12, 11, 0.70, 12),
+        }
+
+        selected = select_sequence_candidate([base, shifted], metrics)
+
+        self.assertEqual(selected.key, shifted.key)
+
+    def test_shifted_night_roi_can_rescue_complete_sequence_without_changing_base_thresholds(self) -> None:
+        config = RecognitionGlobalConfig(
+            sceneMode="night_ir",
+            hardGateMinCenterBrightCoverage=0.46,
+            hardGateMinGapFillRatio=0.76,
+            nightRoiToleranceEnabled=True,
+        )
+        service = RunOnceService(global_config=config)
+        target = RecognitionTarget(
+            deviceId="device",
+            channelId="0",
+            presetIndex=1,
+            presetName="preset",
+            targetId="target",
+            targetName="target",
+            roi=RoiModel(x=50, y=40, width=60, height=40),
+        )
+
+        def extract(_frames, roi):  # noqa: ANN001
+            center = 0.5 if roi.x != 50 else 0.2
+            return [self._feature(index, center_coverage=center) for index in range(20)]
+
+        sequence = self._sequence()
+        # The bright region falls outside the base ROI's center but inside shifted candidates.
+        sequence.frames[:, 55:65, 98:108, :] = 255
+        aligned = AlignedSequence(
+            alignedFrames=sequence.frames,
+            globalShifts=[(0, 0)] * 20,
+            shiftMagnitudes=[0.0] * 20,
+            appliedGlobalShifts=[(0, 0)] * 20,
+            appliedShiftMagnitudes=[0.0] * 20,
+            overflowFlags=[False] * 20,
+            alignmentApplied=False,
+        )
+        with patch("inspector.run_once_service.FullFrameAligner.align", return_value=aligned), patch(
+            "inspector.run_once_service.FrameFeatureExtractor.extract", side_effect=extract
+        ) as extract_mock:
+            result = service._run_detection_pass(sequence=sequence, target=target, effective_config=config)
+
+        self.assertEqual(result.voteDecision.visualState, "has_splash")
+        self.assertIsNotNone(result.roiTolerance)
+        self.assertFalse(result.roiTolerance.selectedCandidate.isBase)
+        self.assertEqual(result.roiTolerance.baseFramePassCount, 0)
+        self.assertEqual(result.roiTolerance.selectedFramePassCount, 20)
+        self.assertLessEqual(result.roiTolerance.evaluatedCandidateCount, 3)
+        self.assertLessEqual(extract_mock.call_count, 3)
+        self.assertTrue(result.roiTolerance.rescued)
+        self.assertEqual(config.hardGateMinCenterBrightCoverage, 0.46)
+        self.assertEqual(config.hardGateMinGapFillRatio, 0.76)
+
+    def test_night_roi_search_does_not_turn_uniform_failure_into_has_splash(self) -> None:
+        config = RecognitionGlobalConfig(sceneMode="night_ir", nightRoiToleranceEnabled=True)
+        service = RunOnceService(global_config=config)
+        target = RecognitionTarget(
+            deviceId="device",
+            channelId="0",
+            presetIndex=1,
+            presetName="preset",
+            targetId="target",
+            targetName="target",
+            roi=RoiModel(x=50, y=40, width=60, height=40),
+        )
+        aligned = AlignedSequence(
+            alignedFrames=self._sequence().frames,
+            globalShifts=[(0, 0)] * 20,
+            shiftMagnitudes=[0.0] * 20,
+            appliedGlobalShifts=[(0, 0)] * 20,
+            appliedShiftMagnitudes=[0.0] * 20,
+            overflowFlags=[False] * 20,
+            alignmentApplied=False,
+        )
+        with patch("inspector.run_once_service.FullFrameAligner.align", return_value=aligned), patch(
+            "inspector.run_once_service.FrameFeatureExtractor.extract",
+            return_value=[self._feature(index, center_coverage=0.0) for index in range(20)],
+        ) as extract_mock:
+            result = service._run_detection_pass(sequence=self._sequence(), target=target, effective_config=config)
+
+        self.assertEqual(result.voteDecision.visualState, "no_splash")
+        self.assertIsNotNone(result.roiTolerance)
+        self.assertTrue(result.roiTolerance.selectedCandidate.isBase)
+        self.assertFalse(result.roiTolerance.rescued)
+        self.assertLessEqual(extract_mock.call_count, 3)
+
+    def test_day_visible_does_not_enter_night_roi_candidate_search(self) -> None:
+        config = RecognitionGlobalConfig(sceneMode="day_visible", nightRoiToleranceEnabled=True)
+        service = RunOnceService(global_config=config)
+        target = RecognitionTarget(
+            deviceId="device",
+            channelId="0",
+            presetIndex=1,
+            presetName="preset",
+            targetId="target",
+            targetName="target",
+            roi=RoiModel(x=50, y=40, width=60, height=40),
+        )
+        aligned = AlignedSequence(
+            alignedFrames=self._sequence().frames,
+            globalShifts=[(0, 0)] * 20,
+            shiftMagnitudes=[0.0] * 20,
+            appliedGlobalShifts=[(0, 0)] * 20,
+            appliedShiftMagnitudes=[0.0] * 20,
+            overflowFlags=[False] * 20,
+            alignmentApplied=False,
+        )
+        with patch("inspector.run_once_service.FullFrameAligner.align", return_value=aligned), patch(
+            "inspector.run_once_service.FrameFeatureExtractor.extract",
+            return_value=[self._feature(index, center_coverage=0.5) for index in range(20)],
+        ) as extract:
+            result = service._run_detection_pass(sequence=self._sequence(), target=target, effective_config=config)
+
+        self.assertIsNone(result.roiTolerance)
+        extract.assert_called_once()
+
+
 class VisualReadinessCheckerTests(unittest.TestCase):
     def test_laplacian_variance_separates_sharp_and_blurry_frames(self) -> None:
         config = RecognitionGlobalConfig(
@@ -172,6 +394,70 @@ class VisualReadinessCheckerTests(unittest.TestCase):
 
 
 class FlvStreamSessionTests(unittest.TestCase):
+    def test_parameterized_ffmpeg_open_passes_timeout_properties_before_open(self) -> None:
+        class _Capture:
+            def __init__(self) -> None:
+                self.opened = False
+                self.open_calls: list[tuple[str, int, list[int]]] = []
+
+            def open(self, url: str, backend: int, parameters: list[int]) -> bool:
+                self.open_calls.append((url, backend, parameters))
+                self.opened = True
+                return True
+
+            def isOpened(self) -> bool:
+                return self.opened
+
+            def set(self, _property: int, _value: int) -> bool:
+                return True
+
+            def release(self) -> None:
+                self.opened = False
+
+        capture = _Capture()
+        cv2_module = types.SimpleNamespace(
+            CAP_FFMPEG=1900,
+            CAP_PROP_OPEN_TIMEOUT_MSEC=53,
+            CAP_PROP_READ_TIMEOUT_MSEC=54,
+            CAP_PROP_BUFFERSIZE=38,
+            VideoCapture=Mock(return_value=capture),
+        )
+        stream_module = types.ModuleType("app.services.dahua_stream_service")
+        stream_module.stream_service = types.SimpleNamespace(
+            get_flv_stream=Mock(return_value=types.SimpleNamespace(streamType="flv", streamUrl="https://stream"))
+        )
+        sampler = FlvSequenceSampler(RecognitionGlobalConfig(streamOpenTimeoutMs=6000, frameReadTimeoutMs=3000))
+
+        with patch.dict(sys.modules, {"cv2": cv2_module, "app.services.dahua_stream_service": stream_module}):
+            session = sampler.open_session(device_id="device", channel_id="0")
+
+        self.assertEqual(capture.open_calls, [("https://stream", 1900, [53, 6000, 54, 3000])])
+        self.assertEqual(session.readTimeoutMs, 3000)
+
+    def test_blocked_read_uses_real_call_elapsed_time_for_timeout_diagnosis(self) -> None:
+        class _SlowCapture:
+            def isOpened(self) -> bool:
+                return True
+
+            def read(self) -> tuple[bool, None]:
+                return True, None
+
+        session = FlvStreamSession(
+            streamType="flv",
+            streamUrl="fake://stream",
+            capture=_SlowCapture(),
+            readTimeoutMs=3000,
+        )
+        monotonic_values = iter([0.0, 0.0, 3.2])
+
+        with patch.object(flv_sampler_module, "monotonic", side_effect=lambda: next(monotonic_values)):
+            frame_result = session.read_frame_until(10.0)
+
+        self.assertIsNone(frame_result)
+        self.assertEqual(session.lastReadFailureReason, "stream_read_timeout")
+        self.assertEqual(session.lastReadCallElapsedMs, 3200)
+        self.assertEqual(session.lastReadFailureElapsedMs, 3200)
+
     def test_read_frame_until_exits_quickly_after_consecutive_failures(self) -> None:
         session = FlvStreamSession(
             streamType="flv",
@@ -3113,6 +3399,137 @@ class RunOnceVisualReadinessTests(unittest.TestCase):
         self.assertEqual(result.effectiveSceneMode, "night_ir")
 
 
+    def test_run_once_reopens_once_when_startup_session_reports_stream_failure(self) -> None:
+        calibration = types.SimpleNamespace(
+            deviceId="device",
+            channelId="0",
+            targetId="target",
+            targetName="target",
+            presetIndex=1,
+            presetName="preset",
+            roi={"x": 0, "y": 0, "width": 16, "height": 16},
+            focusAnchorRoi=None,
+            notes="",
+            snapshotPath="snapshots/demo.png",
+            snapshotUrl="/artifacts/snapshots/demo.png",
+            updatedAt="2026-01-01T00:00:00+00:00",
+        )
+        config = RecognitionGlobalConfig(
+            sceneMode="night_ir",
+            visualReadinessEnabled=False,
+            streamStartupFreshnessEnabled=False,
+            sampleDurationMs=400,
+            sampleFps=10,
+            sequenceFrameCount=4,
+        )
+        service = RunOnceService(global_config=config, raw_config={"sceneMode": "night_ir"})
+        first_session = _FakeSession([])
+        first_session.lastReadFailureReason = "stream_read_timeout"
+        first_session.lastReadFailureCount = 1
+        first_session.lastReadCallElapsedMs = 3100
+        reopened_session = _FakeSession([np.zeros((24, 24, 3), dtype=np.uint8)])
+        sequence = SampledSequence(
+            streamType="flv",
+            streamUrl="fake://stream",
+            frames=np.zeros((4, 24, 24, 3), dtype=np.uint8),
+            frameTimestampsMs=[0, 100, 200, 300],
+            targetFrameCount=4,
+            sampledFrameCount=4,
+            configuredSampleFps=10.0,
+            actualSampleFps=10.0,
+            configuredSampleDurationMs=400,
+            actualSampleDurationMs=300,
+            frameWidth=24,
+            frameHeight=24,
+        )
+        guard_result = types.SimpleNamespace(
+            passed=True,
+            sequence=sequence,
+            metrics=SampleQualityMetrics(passed=True, reason="sample_quality_passed"),
+            activeSession=None,
+            attemptStartFrame=None,
+            degradedFrame=None,
+            lastQualifiedFrame=None,
+            acceptedMiddleFrame=None,
+            acceptedEndFrame=None,
+            observedFrames=None,
+            observedTimestampsMs=None,
+        )
+        service.sampler.open_session = Mock(side_effect=[first_session, reopened_session])
+        service._sample_with_quality_guard = Mock(return_value=(sequence, guard_result))
+        service.replay_store.persist_async = Mock(
+            return_value=({}, ReplaySaveState(status="disabled", message="not needed"))
+        )
+        fake_preset_module = types.ModuleType("app.services.dahua_preset_service")
+        fake_preset_module.preset_service = types.SimpleNamespace(turn_preset=Mock(return_value=None))
+        fake_sign_module = types.ModuleType("app.utils.request_sign_adapter")
+        fake_sign_module.DahuaApiError = type("DahuaApiError", (Exception,), {})
+
+        with patch("inspector.run_once_service.storage_service.load_path", return_value=calibration):
+            with patch("app.config.Settings.is_dahua_configured", new_callable=PropertyMock, return_value=True):
+                with patch.dict(
+                    sys.modules,
+                    {
+                        "app.services.dahua_preset_service": fake_preset_module,
+                        "app.utils.request_sign_adapter": fake_sign_module,
+                    },
+                ):
+                    result = service.run(config_path=Path("demo.json"), requested_preset_index=1)
+
+        self.assertEqual(result.executionResult, "success")
+        self.assertTrue(result.preReadinessSessionReopened)
+        self.assertTrue(result.preReadinessStreamRecovered)
+        self.assertEqual(result.preReadinessStreamRetryCount, 1)
+        self.assertEqual(result.streamReadFailureReason, "stream_read_timeout")
+        self.assertEqual(result.streamReadCallElapsedMs, 3100)
+        self.assertEqual(service.sampler.open_session.call_count, 2)
+
+    def test_run_once_reports_stream_timeout_when_pre_readiness_reopen_fails(self) -> None:
+        calibration = types.SimpleNamespace(
+            deviceId="device",
+            channelId="0",
+            targetId="target",
+            targetName="target",
+            presetIndex=1,
+            presetName="preset",
+            roi={"x": 0, "y": 0, "width": 16, "height": 16},
+            focusAnchorRoi=None,
+            notes="",
+            snapshotPath="snapshots/demo.png",
+            snapshotUrl="/artifacts/snapshots/demo.png",
+            updatedAt="2026-01-01T00:00:00+00:00",
+        )
+        config = RecognitionGlobalConfig(sceneMode="night_ir", visualReadinessEnabled=False, streamStartupFreshnessEnabled=False)
+        service = RunOnceService(global_config=config, raw_config={"sceneMode": "night_ir"})
+        first_session = _FakeSession([])
+        first_session.lastReadFailureReason = "stream_read_timeout"
+        first_session.lastReadFailureCount = 1
+        first_session.lastReadCallElapsedMs = 3100
+        service.sampler.open_session = Mock(
+            side_effect=[first_session, FlvSamplerError("reopen unavailable", reason="stream_failed")]
+        )
+        fake_preset_module = types.ModuleType("app.services.dahua_preset_service")
+        fake_preset_module.preset_service = types.SimpleNamespace(turn_preset=Mock(return_value=None))
+        fake_sign_module = types.ModuleType("app.utils.request_sign_adapter")
+        fake_sign_module.DahuaApiError = type("DahuaApiError", (Exception,), {})
+
+        with patch("inspector.run_once_service.storage_service.load_path", return_value=calibration):
+            with patch("app.config.Settings.is_dahua_configured", new_callable=PropertyMock, return_value=True):
+                with patch.dict(
+                    sys.modules,
+                    {
+                        "app.services.dahua_preset_service": fake_preset_module,
+                        "app.utils.request_sign_adapter": fake_sign_module,
+                    },
+                ):
+                    result = service.run(config_path=Path("demo.json"), requested_preset_index=1)
+
+        self.assertEqual(result.executionResult, "stream_read_timeout")
+        self.assertNotEqual(result.executionResult, "scene_mode_transition_timeout")
+        self.assertTrue(result.preReadinessSessionReopened)
+        self.assertFalse(result.preReadinessStreamRecovered)
+
+
 class PseudoMultiPointSummaryTests(unittest.TestCase):
     def test_summary_counts_visual_readiness_and_static_bright_rounds(self) -> None:
         rounds = [
@@ -3212,6 +3629,144 @@ class PseudoMultiPointSummaryTests(unittest.TestCase):
 
 
 class PseudoMultiPointRunnerTests(unittest.TestCase):
+    @staticmethod
+    def _successful_round_recognition_result() -> RecognitionRunResult:
+        target = RecognitionTarget(
+            deviceId="device",
+            channelId="0",
+            presetIndex=1,
+            presetName="preset",
+            targetId="target",
+            targetName="target",
+            roi={"x": 0, "y": 0, "width": 1, "height": 1},
+        )
+        return RecognitionRunResult(
+            executionResult="success",
+            visualState="no_splash",
+            sceneMode="night_ir",
+            requestedSceneMode="night_ir",
+            effectiveSceneMode="night_ir",
+            sceneModeConfidence=1.0,
+            sceneModeReason="test",
+            sceneModeFallbackUsed=False,
+            sceneModeDiagnostics=None,
+            dayVisibleVisualState=None,
+            nightIrVisualState="no_splash",
+            fallbackResolution="not_needed",
+            scoreSummary=RecognitionScoreSummary(),
+            evidencePaths=RecognitionEvidencePaths(calibrationPath="demo.json"),
+            replaySave=ReplaySaveState(status="disabled", message="not needed"),
+            timing=RecognitionTiming(),
+            algorithmVersion="test",
+            configPath="demo.json",
+            target=target,
+        )
+
+    def test_round_timeout_warn_only_preserves_correct_recognition_and_reports_slo(self) -> None:
+        runtime_config = PseudoMultiPointRuntimeConfig(
+            configPath=Path("demo.json"),
+            transitionPresetIndex=2,
+            transitionSettleMs=0,
+            rounds=1,
+            expectedVisualState="no_splash",
+            sceneModeOverride=None,
+            transitionPresetTimeoutSeconds=5.0,
+            roundTimeoutSeconds=0.001,
+            outputRoot=Path("data/pseudo_multi_point_tests"),
+        )
+        runner = PseudoMultiPointRunner(
+            runtime_config,
+            run_once_service=_FakeRunOnceService(self._successful_round_recognition_result()),
+            transition_turner=_FakeTransitionTurner(),
+        )
+        round_result = runner._finalize_round(
+            round_index=1,
+            started_at="2026-01-01T00:00:00+00:00",
+            round_started_perf=perf_counter() - 0.1,
+            transition_result=TransitionPresetStepResult(presetIndex=2, elapsedMs=1, timeoutSeconds=5.0),
+            transition_settle_wait_ms_actual=0,
+            recognition_result=self._successful_round_recognition_result(),
+            expected_visual_state="no_splash",
+            expected_matched=True,
+            actual_visual_state="no_splash",
+            failure_step=None,
+            failure_reason=None,
+            status="success",
+        )
+
+        self.assertEqual(round_result.status, "success")
+        self.assertTrue(round_result.expectedVisualStateMatched)
+        self.assertTrue(round_result.roundTimedOut)
+        self.assertTrue(round_result.timingSloExceeded)
+        self.assertFalse(round_result.strictTimeoutFailed)
+        self.assertIsNone(round_result.failureStep)
+
+    def test_round_timeout_fail_turns_correct_recognition_into_strict_timeout_failure(self) -> None:
+        runtime_config = PseudoMultiPointRuntimeConfig(
+            configPath=Path("demo.json"),
+            transitionPresetIndex=2,
+            transitionSettleMs=0,
+            rounds=1,
+            expectedVisualState="no_splash",
+            sceneModeOverride=None,
+            transitionPresetTimeoutSeconds=5.0,
+            roundTimeoutSeconds=0.001,
+            outputRoot=Path("data/pseudo_multi_point_tests"),
+            roundTimeoutPolicy="fail",
+        )
+        runner = PseudoMultiPointRunner(
+            runtime_config,
+            run_once_service=_FakeRunOnceService(self._successful_round_recognition_result()),
+            transition_turner=_FakeTransitionTurner(),
+        )
+        round_result = runner._finalize_round(
+            round_index=1,
+            started_at="2026-01-01T00:00:00+00:00",
+            round_started_perf=perf_counter() - 0.1,
+            transition_result=TransitionPresetStepResult(presetIndex=2, elapsedMs=1, timeoutSeconds=5.0),
+            transition_settle_wait_ms_actual=0,
+            recognition_result=self._successful_round_recognition_result(),
+            expected_visual_state="no_splash",
+            expected_matched=True,
+            actual_visual_state="no_splash",
+            failure_step=None,
+            failure_reason=None,
+            status="success",
+        )
+
+        self.assertEqual(round_result.status, "failed")
+        self.assertTrue(round_result.timingSloExceeded)
+        self.assertTrue(round_result.strictTimeoutFailed)
+        self.assertEqual(round_result.failureStep, "round_timeout")
+
+    def test_warn_only_timeout_with_recognition_failure_uses_distinct_console_outcome(self) -> None:
+        round_result = PseudoMultiPointRoundResult(
+            roundIndex=1,
+            startedAt="2026-01-01T00:00:00+00:00",
+            finishedAt="2026-01-01T00:00:26+00:00",
+            status="failed",
+            expectedVisualState="no_splash",
+            expectedVisualStateMatched=False,
+            actualVisualState="undetermined",
+            failureStep="recognition_execution",
+            failureReason="stream failed",
+            roundElapsedMs=26000,
+            roundTimedOut=True,
+            roundTimeoutSeconds=25.0,
+            roundTimeoutPolicy="warn_only",
+            timingSloExceeded=True,
+            timingSloReason="Round exceeded timing SLO 25.00s (elapsed 26000 ms).",
+            strictTimeoutFailed=False,
+            transitionSettleMsConfigured=0,
+            transitionSettleWaitMsActual=0,
+            transitionPreset=TransitionPresetStepResult(presetIndex=2, elapsedMs=1, timeoutSeconds=5.0),
+        )
+
+        with redirect_stderr(io.StringIO()) as output:
+            emit_round_progress(round_result)
+
+        self.assertIn("timingOutcome=over_slo_with_recognition_failure", output.getvalue())
+
     def test_pending_replay_save_keeps_target_paths_separate_from_ready_paths(self) -> None:
         calibration_target = RecognitionTarget(
             deviceId="device",
@@ -3674,6 +4229,94 @@ class PseudoMultiPointRunnerTests(unittest.TestCase):
 
 
 class ReplayStoreTests(unittest.TestCase):
+    def test_legacy_handoff_without_roi_tolerance_path_uses_run_directory(self) -> None:
+        store = ReplayStore(RecognitionGlobalConfig())
+        path_keys = (
+            "sequencePath",
+            "metadataPath",
+            "statusPath",
+            "streamStartupStartFramePath",
+            "streamStartupSettledFramePath",
+            "sceneModeStabilityStartFramePath",
+            "sceneModeStabilitySettledFramePath",
+            "representativeFramePath",
+            "sceneProbeStartFramePath",
+            "sceneProbeEndFramePath",
+            "debugImagePath",
+            "visualReadinessStartFramePath",
+            "visualReadinessReadyFramePath",
+            "visualReadinessConfirmFramePath",
+            "sampleStartFramePath",
+            "sampleQualityAttemptStartFramePath",
+            "sampleQualityDegradedFramePath",
+            "sampleQualityLastQualifiedFramePath",
+            "sampleQualityAcceptedMiddleFramePath",
+            "sampleQualityAcceptedEndFramePath",
+            "configSnapshotPath",
+            "rawFramesPath",
+            "rawTimestampsPath",
+            "rawReadinessKeyFramesPath",
+        )
+
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+            run_dir = Path(temp_dir)
+            handoff_path = run_dir / "legacy-handoff.json"
+            frames = np.zeros((1, 1, 3), dtype=np.uint8)
+            timestamps = np.array([0], dtype=np.int32)
+            raw_frames_path = run_dir / "rawFramesPath.tmp"
+            raw_timestamps_path = run_dir / "rawTimestampsPath.tmp"
+            frames.tofile(raw_frames_path)
+            timestamps.tofile(raw_timestamps_path)
+            handoff = {
+                "paths": {
+                    "runDir": str(run_dir),
+                    "handoffPath": str(handoff_path),
+                    **{key: str(run_dir / f"{key}.tmp") for key in path_keys},
+                },
+                "rawSequence": {
+                    "frames": {"dtype": "uint8", "shape": [1, 1, 1, 3]},
+                    "timestamps": {"dtype": "int32", "shape": [1]},
+                },
+                "target": {
+                    "deviceId": "device",
+                    "channelId": "0",
+                    "presetIndex": 1,
+                    "presetName": "preset",
+                    "targetId": "target",
+                    "targetName": "target",
+                    "roi": {"x": 0, "y": 0, "width": 1, "height": 1},
+                },
+                "effectiveRecognitionConfig": RecognitionGlobalConfig().snapshot(),
+                "sequenceMetadata": {
+                    "streamType": "flv",
+                    "streamUrl": "fake://stream",
+                    "targetFrameCount": 1,
+                    "sampledFrameCount": 1,
+                    "configuredSampleFps": 10.0,
+                    "actualSampleFps": 10.0,
+                    "configuredSampleDurationMs": 100,
+                    "actualSampleDurationMs": 100,
+                    "frameWidth": 1,
+                    "frameHeight": 1,
+                },
+                "configPath": "demo.json",
+                "extraMetadata": {},
+                "hasReadinessKeyFrames": False,
+            }
+            handoff["paths"]["rawFramesPath"] = str(raw_frames_path)
+            handoff["paths"]["rawTimestampsPath"] = str(raw_timestamps_path)
+            handoff_path.write_text(json.dumps(handoff), encoding="utf-8")
+
+            with patch.object(store, "_persist_sync") as persist_sync:
+                store.write_from_handoff(handoff_path)
+
+            restored_paths = persist_sync.call_args.args[0]
+            self.assertEqual(
+                restored_paths["roiToleranceSelectedFramePath"],
+                run_dir / "roi-tolerance-selected-frame.ppm",
+            )
+        self.assertFalse(handoff_path.exists())
+
     def test_focus_anchor_artifacts_use_focus_roi_while_detection_artifacts_keep_detection_roi(self) -> None:
         store = ReplayStore(RecognitionGlobalConfig())
         target = RecognitionTarget(
@@ -3714,6 +4357,7 @@ class ReplayStoreTests(unittest.TestCase):
                 "sceneModeStabilityStartFramePath": run_dir / "scene-mode-stability-start.ppm",
                 "sceneModeStabilitySettledFramePath": run_dir / "scene-mode-stability-settled.ppm",
                 "representativeFramePath": run_dir / "representative-frame.ppm",
+                "roiToleranceSelectedFramePath": run_dir / "roi-tolerance-selected-frame.ppm",
                 "sceneProbeStartFramePath": run_dir / "scene-probe-start.ppm",
                 "sceneProbeEndFramePath": run_dir / "scene-probe-end.ppm",
                 "visualReadinessStartFramePath": run_dir / "visual-readiness-start.ppm",
@@ -3760,6 +4404,8 @@ class ReplayStoreTests(unittest.TestCase):
                                 "visualReadinessReadyFrameIndex": 1,
                                 "sampleStartFrameIndex": 0,
                                 "representativeFrameIndex": 1,
+                                "roiToleranceSelectedFrameIndex": 1,
+                                "roiToleranceSelectedRoi": {"x": 2, "y": 2, "width": 5, "height": 5},
                             },
                             readiness_key_frames={
                                 "visualReadinessStartFrame": frame.copy(),
@@ -3773,6 +4419,7 @@ class ReplayStoreTests(unittest.TestCase):
         self.assertEqual(captured_rois["sample-quality-attempt-start.ppm"], target.focusAnchorRoi.model_dump())
         self.assertEqual(captured_rois["sample-start.ppm"], target.roi.model_dump())
         self.assertEqual(captured_rois["representative-frame.ppm"], target.roi.model_dump())
+        self.assertEqual(captured_rois["roi-tolerance-selected-frame.ppm"], {"x": 2, "y": 2, "width": 5, "height": 5})
 
     def test_readiness_failure_still_writes_readiness_artifacts_without_representative_frame(self) -> None:
         store = ReplayStore(RecognitionGlobalConfig())

@@ -14,6 +14,246 @@
   font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
 }
 
+.calibrationWorkbench {
+  min-height: 100vh;
+  padding: 18px;
+  background:
+    linear-gradient(90deg, rgba(20, 74, 67, 0.045) 1px, transparent 1px),
+    linear-gradient(rgba(20, 74, 67, 0.045) 1px, transparent 1px),
+    #edf1ef;
+  background-size: 28px 28px;
+}
+
+.workbenchTopbar {
+  min-height: 76px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  margin-bottom: 14px;
+  padding: 14px 18px;
+  border: 1px solid #cdd8d4;
+  border-radius: 14px;
+  background: rgba(255, 255, 252, 0.92);
+  box-shadow: 0 8px 22px rgba(21, 53, 49, 0.07);
+}
+
+.workbenchConnection {
+  flex: 1 1 620px;
+  min-width: 0;
+}
+
+.topbarConnectionPanel {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px 14px;
+  align-items: end;
+}
+
+.topbarConnectionPanel .panelHeader {
+  margin: 0;
+}
+
+.topbarConnectionPanel .panelHeader h2 {
+  font-size: 14px;
+  white-space: nowrap;
+}
+
+.topbarConnectionPanel .statusBadge {
+  display: none;
+}
+
+.deviceFieldGrid {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) 72px 128px;
+  gap: 8px;
+}
+
+.deviceFieldGrid label {
+  margin: 0;
+}
+
+.deviceFieldGrid input,
+.deviceFieldGrid select {
+  margin-top: 0.25rem;
+  padding: 0.55rem 0.65rem;
+  border-radius: 9px;
+}
+
+.deviceActionRow {
+  display: flex;
+  gap: 8px;
+}
+
+.deviceActionRow button {
+  padding: 0.55rem 0.7rem;
+  border-radius: 9px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.workbenchKicker {
+  margin: 0 0 4px;
+  color: #21645d;
+  font-size: 12px;
+  letter-spacing: 0.12em;
+}
+
+.workbenchTopbar h1 {
+  margin: 0;
+  font-size: 22px;
+  letter-spacing: 0.02em;
+}
+
+.workbenchStatus {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  color: #465853;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.statusDot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #d49b32;
+  box-shadow: 0 0 0 3px rgba(212, 155, 50, 0.14);
+}
+
+.statusDivider {
+  width: 1px;
+  height: 18px;
+  background: #d4ded9;
+}
+
+.workbenchMessage {
+  margin-bottom: 12px;
+  padding: 10px 13px;
+  border-left: 3px solid #1b765d;
+  background: #f5faf8;
+  color: #20574f;
+  font-size: 14px;
+}
+
+.operatorWorkbenchGrid {
+  display: grid;
+  gap: 14px;
+}
+
+.operatorWorkbenchGrid {
+  grid-template-columns: 292px minmax(560px, 1fr) 336px;
+  align-items: start;
+}
+
+.workbenchSidebar,
+.workbenchStage {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.workbenchSectionHeading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 3px 2px 6px;
+  border-bottom: 1px solid #cad6d1;
+  color: #1c3934;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.workbenchSectionHeading small {
+  color: #7b9088;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+}
+
+.calibrationWorkbench .panel {
+  border-radius: 12px;
+  background: rgba(255, 255, 252, 0.94);
+  box-shadow: 0 7px 18px rgba(21, 53, 49, 0.06);
+}
+
+.calibrationWorkbench .panelHeader h2 {
+  font-size: 15px;
+}
+
+.calibrationWorkbench .previewPanel .videoFrame {
+  min-height: 300px;
+}
+
+.operatorStage .previewPanel {
+  margin: 0;
+}
+
+.diagnosticsDrawer {
+  border: 1px solid #cad6d1;
+  border-radius: 10px;
+  background: rgba(255, 255, 252, 0.82);
+}
+
+.diagnosticsDrawer > summary {
+  padding: 11px 13px;
+  cursor: pointer;
+  color: #31564f;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.diagnosticsDrawer .panel {
+  border: 0;
+  box-shadow: none;
+}
+
+@media (max-width: 1439px) {
+  .workbenchTopbar {
+    align-items: start;
+    flex-wrap: wrap;
+  }
+
+  .workbenchConnection {
+    order: 3;
+    flex-basis: 100%;
+  }
+
+  .operatorWorkbenchGrid {
+    grid-template-columns: 280px minmax(0, 1fr);
+  }
+
+  .operatorReview {
+    grid-column: 1 / -1;
+    display: grid;
+    grid-template-columns: minmax(320px, 0.9fr) minmax(0, 1.1fr);
+  }
+
+}
+
+@media (max-width: 1023px) {
+  .calibrationWorkbench {
+    display: grid;
+    place-items: center;
+    padding: 24px;
+  }
+
+  .calibrationWorkbench::before {
+    content: "新版标定工作台需要至少 1024px 宽度，请使用电脑端浏览器。";
+    max-width: 460px;
+    padding: 22px;
+    border-radius: 14px;
+    background: #fffefb;
+    box-shadow: 0 10px 30px rgba(21, 53, 49, 0.12);
+    color: #31564f;
+    text-align: center;
+  }
+
+  .calibrationWorkbench > * { display: none; }
+}
+
 * {
   box-sizing: border-box;
 }
@@ -273,11 +513,11 @@ label span {
 }
 
 .detectionOverlay {
-  border-color: #7ef0b3;
+  border-color: #dc4b45;
 }
 
 .focusOverlay {
-  border-color: #ffb24d;
+  border-color: #3378c9;
 }
 
 .roiOverlay.active {
@@ -322,11 +562,11 @@ label span {
 }
 
 .roiLegendItem.detection::before {
-  background: #7ef0b3;
+  background: #dc4b45;
 }
 
 .roiLegendItem.focus::before {
-  background: #ffb24d;
+  background: #3378c9;
 }
 
 .roiLegendItem.active {
@@ -368,6 +608,97 @@ label span {
   border-radius: 16px;
   background: rgba(27, 118, 93, 0.08);
   color: var(--primary-strong);
+}
+
+.calibrationChecklist {
+  display: grid;
+  gap: 0.45rem;
+  margin-bottom: 1rem;
+}
+
+.checklistItem {
+  display: grid;
+  grid-template-columns: 1rem 1fr auto;
+  gap: 0.45rem;
+  align-items: center;
+  color: #7a6552;
+  font-size: 0.84rem;
+}
+
+.checklistItem.complete {
+  color: #17614f;
+}
+
+.checklistItem small {
+  color: inherit;
+  font-size: 0.76rem;
+}
+
+.secondaryActionStack {
+  display: grid;
+  gap: 0.55rem;
+  margin-top: 0.75rem;
+}
+
+.existingCalibrationsDrawer {
+  border: 1px solid #cad6d1;
+  border-radius: 10px;
+  background: rgba(255, 255, 252, 0.82);
+}
+
+.existingCalibrationsDrawer > summary {
+  padding: 11px 13px;
+  cursor: pointer;
+  color: #31564f;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.existingCalibrationContent {
+  display: grid;
+  gap: 0.7rem;
+  padding: 0 11px 12px;
+}
+
+.existingCalibrationList,
+.historyList {
+  display: grid;
+  gap: 0.45rem;
+  max-height: 250px;
+  overflow: auto;
+}
+
+.existingCalibrationItem {
+  display: grid;
+  gap: 0.18rem;
+  padding: 0.65rem 0.7rem;
+  border-radius: 8px;
+  background: #eef5f2;
+  color: #234d45;
+  text-align: left;
+}
+
+.existingCalibrationItem span,
+.existingCalibrationItem small,
+.historyItem small {
+  color: #647a72;
+  font-size: 0.76rem;
+}
+
+.historyList h3 {
+  margin: 0.35rem 0 0;
+  color: #31564f;
+  font-size: 0.85rem;
+}
+
+.historyItem {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0.25rem;
+  padding: 0.6rem;
+  border-top: 1px solid #e1eae6;
+  color: #31564f;
+  font-size: 0.82rem;
 }
 
 .messageBar {

@@ -12,6 +12,7 @@ ExecutionResult = Literal[
     "success",
     "preset_failed",
     "stream_failed",
+    "stream_read_timeout",
     "insufficient_frames",
     "visual_not_ready",
     "visual_not_ready_timeout",
@@ -132,6 +133,7 @@ class RecognitionEvidencePaths(BaseModel):
     sceneProbeStartFramePath: str | None = None
     sceneProbeEndFramePath: str | None = None
     representativeFramePath: str | None = None
+    roiToleranceSelectedFramePath: str | None = None
     visualReadinessStartFramePath: str | None = None
     visualReadinessReadyFramePath: str | None = None
     visualReadinessConfirmFramePath: str | None = None
@@ -237,6 +239,9 @@ class StreamStartupFreshnessMetrics(BaseModel):
     jumpDetected: bool = False
     stableAfterJump: bool = False
     exitReason: str
+    streamReadFailureReason: str | None = None
+    streamReadFailureCount: int = 0
+    streamReadCallElapsedMs: int = 0
 
 
 class SceneModeStabilityMetrics(BaseModel):
@@ -291,6 +296,22 @@ class RecognitionRunResult(BaseModel):
     sampleQualityMaxRecoveriesConfigured: int | None = None
     sampleQualityRecoveryCountSemantics: str | None = None
     sampleQuality: SampleQualityMetrics | None = None
+    preReadinessSessionReopened: bool = False
+    preReadinessStreamRecovered: bool = False
+    preReadinessStreamRetryCount: int = 0
+    streamReadFailureReason: str | None = None
+    streamReadFailureCount: int = 0
+    streamReadCallElapsedMs: int = 0
+    roiToleranceEnabled: bool | None = None
+    roiToleranceCandidateCount: int | None = None
+    roiToleranceEvaluatedCandidateCount: int | None = None
+    roiToleranceSelectedRoi: RoiModel | None = None
+    roiToleranceSelectedOffsetXRatio: float | None = None
+    roiToleranceSelectedOffsetYRatio: float | None = None
+    roiToleranceSelectedScale: float | None = None
+    roiToleranceBaseFramePassCount: int | None = None
+    roiToleranceSelectedFramePassCount: int | None = None
+    roiToleranceRescued: bool | None = None
     scoreSummary: RecognitionScoreSummary
     evidencePaths: RecognitionEvidencePaths
     replaySave: "ReplaySaveState"

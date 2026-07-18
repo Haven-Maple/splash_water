@@ -1,7 +1,7 @@
 后端启动：python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 前端启动：npm run dev
 测试命令：python -m inspector.run_once --config data/calibrations/AB00A7DPAJ00124_1.json --preset 1 > run_once_result.json
-10轮巡检预置点1测试命令：python -m inspector.pseudo_multi_point_test --config data/calibrations/AB00A7DPAJ00124_1.json --transition-preset 2 --rounds 10 --expected-visual-state has_splash --transition-settle-ms 1200
+10轮巡检预置点1测试命令：python -m inspector.pseudo_multi_point_test --config data/calibrations/AB00A7DPAJ00124_1.json --transition-preset 3 --rounds 10 --expected-visual-state has_splash --transition-settle-ms 1800
 各个功能请求体举例：
 云台控制请求体
 {

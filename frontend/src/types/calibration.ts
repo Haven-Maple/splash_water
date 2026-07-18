@@ -30,7 +30,34 @@ export interface CalibrationRecord {
   notes: string;
   snapshotPath?: string | null;
   snapshotUrl?: string | null;
+  snapshotOriginalPath?: string | null;
+  snapshotOriginalUrl?: string | null;
+  snapshotAnnotatedPath?: string | null;
+  snapshotAnnotatedUrl?: string | null;
+  version?: number | null;
+  legacy: boolean;
+  restoredFromVersion?: number | null;
   updatedAt: string;
+}
+
+export interface CalibrationListItem {
+  deviceId: string;
+  presetIndex: number;
+  targetName: string;
+  updatedAt: string;
+  path: string;
+  version?: number | null;
+  legacy: boolean;
+}
+
+export interface CalibrationHistoryItem {
+  version: number;
+  updatedAt: string;
+  targetName: string;
+  legacy: boolean;
+  restoredFromVersion?: number | null;
+  snapshotOriginalUrl?: string | null;
+  snapshotAnnotatedUrl?: string | null;
 }
 
 export interface CalibrationToolRuntimeConfig {

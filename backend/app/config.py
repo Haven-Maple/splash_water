@@ -130,6 +130,7 @@ class Settings:
         self.ptz_verified_map = _read_string_map(self.local_config.get("ptz_verified_map"))
 
         self.calibration_dir.mkdir(parents=True, exist_ok=True)
+        self.calibration_history_dir.mkdir(parents=True, exist_ok=True)
         self.snapshot_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -152,6 +153,10 @@ class Settings:
     @property
     def snapshot_dir(self) -> Path:
         return self.data_root / "snapshots"
+
+    @property
+    def calibration_history_dir(self) -> Path:
+        return self.data_root / "calibration_history"
 
     @property
     def request_sign_path(self) -> Path:

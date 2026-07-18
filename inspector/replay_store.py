@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 
 from app.config import settings
+from app.schemas.calibration import RoiModel
 from app.utils.logging_utils import logger
 from app.utils.time_utils import iso_utc_now
 
@@ -40,6 +41,7 @@ class ReplayStore:
             "sceneModeStabilityStartFramePath": run_dir / "scene-mode-stability-start.ppm",
             "sceneModeStabilitySettledFramePath": run_dir / "scene-mode-stability-settled.ppm",
             "representativeFramePath": run_dir / "representative-frame.ppm",
+            "roiToleranceSelectedFramePath": run_dir / "roi-tolerance-selected-frame.ppm",
             "sceneProbeStartFramePath": run_dir / "scene-probe-start.ppm",
             "sceneProbeEndFramePath": run_dir / "scene-probe-end.ppm",
             "visualReadinessStartFramePath": run_dir / "visual-readiness-start.ppm",
@@ -127,8 +129,9 @@ class ReplayStore:
 
     def write_from_handoff(self, handoff_path: Path) -> None:
         handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
+        run_dir = Path(handoff["paths"]["runDir"])
         paths = {
-            "runDir": Path(handoff["paths"]["runDir"]),
+            "runDir": run_dir,
             "sequencePath": Path(handoff["paths"]["sequencePath"]),
             "metadataPath": Path(handoff["paths"]["metadataPath"]),
             "statusPath": Path(handoff["paths"]["statusPath"]),
@@ -137,6 +140,9 @@ class ReplayStore:
             "sceneModeStabilityStartFramePath": Path(handoff["paths"]["sceneModeStabilityStartFramePath"]),
             "sceneModeStabilitySettledFramePath": Path(handoff["paths"]["sceneModeStabilitySettledFramePath"]),
             "representativeFramePath": Path(handoff["paths"]["representativeFramePath"]),
+            "roiToleranceSelectedFramePath": Path(
+                handoff["paths"].get("roiToleranceSelectedFramePath", run_dir / "roi-tolerance-selected-frame.ppm")
+            ),
             "sceneProbeStartFramePath": Path(handoff["paths"]["sceneProbeStartFramePath"]),
             "sceneProbeEndFramePath": Path(handoff["paths"]["sceneProbeEndFramePath"]),
             "debugImagePath": Path(handoff["paths"]["debugImagePath"]),
@@ -367,6 +373,7 @@ class ReplayStore:
             "sceneModeStabilityStartFramePath": str(paths["sceneModeStabilityStartFramePath"]),
             "sceneModeStabilitySettledFramePath": str(paths["sceneModeStabilitySettledFramePath"]),
             "representativeFramePath": str(paths["representativeFramePath"]),
+            "roiToleranceSelectedFramePath": str(paths["roiToleranceSelectedFramePath"]),
             "sceneProbeStartFramePath": str(paths["sceneProbeStartFramePath"]),
             "sceneProbeEndFramePath": str(paths["sceneProbeEndFramePath"]),
             "visualReadinessStartFramePath": str(paths["visualReadinessStartFramePath"]),
@@ -535,6 +542,17 @@ class ReplayStore:
                 aligned_sequence.alignedFrames[frame_index],
                 target.roi,
             )
+            selected_roi_payload = extra_metadata.get("roiToleranceSelectedRoi")
+            selected_frame_index = extra_metadata.get("roiToleranceSelectedFrameIndex")
+            if isinstance(selected_roi_payload, dict) and selected_frame_index is not None:
+                selected_roi = RoiModel.model_validate(selected_roi_payload)
+                selected_index = int(selected_frame_index)
+                if 0 <= selected_index < len(aligned_sequence.alignedFrames):
+                    write_representative_roi_ppm(
+                        paths["roiToleranceSelectedFramePath"],
+                        aligned_sequence.alignedFrames[selected_index],
+                        selected_roi,
+                    )
             if not debug_written:
                 previous_index = max(0, frame_index - 1)
                 write_motion_debug_pgm(

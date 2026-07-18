@@ -20,7 +20,10 @@ class CalibrationSaveRequest(BaseModel):
     roi: RoiModel
     focusAnchorRoi: RoiModel
     notes: str = ""
+    # snapshotBase64 remains accepted for older clients during the V2 rollout.
     snapshotBase64: str | None = None
+    snapshotOriginalBase64: str | None = None
+    snapshotAnnotatedBase64: str | None = None
 
 
 class CalibrationRecord(BaseModel):
@@ -35,6 +38,13 @@ class CalibrationRecord(BaseModel):
     notes: str
     snapshotPath: str | None = None
     snapshotUrl: str | None = None
+    snapshotOriginalPath: str | None = None
+    snapshotOriginalUrl: str | None = None
+    snapshotAnnotatedPath: str | None = None
+    snapshotAnnotatedUrl: str | None = None
+    version: int | None = None
+    legacy: bool = False
+    restoredFromVersion: int | None = None
     updatedAt: str
 
 
@@ -61,6 +71,28 @@ class CalibrationListItem(BaseModel):
     targetName: str
     updatedAt: str
     path: str
+    version: int | None = None
+    legacy: bool = False
+
+
+class CalibrationHistoryItem(BaseModel):
+    version: int = Field(ge=1)
+    updatedAt: str
+    targetName: str
+    legacy: bool = False
+    restoredFromVersion: int | None = None
+    snapshotOriginalUrl: str | None = None
+    snapshotAnnotatedUrl: str | None = None
+
+
+class CalibrationHistoryResponse(BaseModel):
+    items: list[CalibrationHistoryItem]
+
+
+class CalibrationRestoreRequest(BaseModel):
+    deviceId: str = Field(min_length=1)
+    presetIndex: int = Field(ge=0)
+    version: int = Field(ge=1)
 
 
 class CalibrationOperationResponse(BaseModel):

@@ -26,6 +26,7 @@ VisualStateLiteral = Literal["has_splash", "no_splash", "undetermined"]
 SceneModeOverrideLiteral = Literal["auto", "day_visible", "night_ir"]
 RoundStatusLiteral = Literal["success", "failed"]
 RunStatusLiteral = Literal["completed", "interrupted", "aborted"]
+RoundTimeoutPolicy = Literal["warn_only", "fail"]
 
 
 class TransitionPresetStepResult(BaseModel):
@@ -51,6 +52,10 @@ class PseudoMultiPointRoundResult(BaseModel):
     roundElapsedMs: int
     roundTimedOut: bool = False
     roundTimeoutSeconds: float
+    roundTimeoutPolicy: RoundTimeoutPolicy = "warn_only"
+    timingSloExceeded: bool = False
+    timingSloReason: str | None = None
+    strictTimeoutFailed: bool = False
     transitionSettleMsConfigured: int
     transitionSettleWaitMsActual: int
     transitionPreset: TransitionPresetStepResult
@@ -78,6 +83,16 @@ class PseudoMultiPointRoundResult(BaseModel):
     scoreGapFillPassCount: int | None = None
     scoreHardGateMinGapFillRatioConfigured: float | None = None
     scoreGapFillRatioMean: float | None = None
+    roiToleranceEnabled: bool | None = None
+    roiToleranceCandidateCount: int | None = None
+    roiToleranceEvaluatedCandidateCount: int | None = None
+    roiToleranceSelectedRoi: dict[str, int] | None = None
+    roiToleranceSelectedOffsetXRatio: float | None = None
+    roiToleranceSelectedOffsetYRatio: float | None = None
+    roiToleranceSelectedScale: float | None = None
+    roiToleranceBaseFramePassCount: int | None = None
+    roiToleranceSelectedFramePassCount: int | None = None
+    roiToleranceRescued: bool | None = None
     twilightProfileApplied: bool | None = None
     twilightProfileReason: str | None = None
     twilightBrightnessMean: float | None = None
@@ -88,6 +103,15 @@ class PseudoMultiPointRoundResult(BaseModel):
     streamStartupFreshnessElapsedMs: int | None = None
     streamStartupFreshnessJumpDetected: bool | None = None
     streamStartupFreshnessStableAfterJump: bool | None = None
+    streamStartupReadFailureReason: str | None = None
+    streamStartupReadFailureCount: int | None = None
+    streamStartupReadCallElapsedMs: int | None = None
+    preReadinessSessionReopened: bool | None = None
+    preReadinessStreamRecovered: bool | None = None
+    preReadinessStreamRetryCount: int | None = None
+    streamReadFailureReason: str | None = None
+    streamReadFailureCount: int | None = None
+    streamReadCallElapsedMs: int | None = None
     visualReadinessPassed: bool | None = None
     visualReadinessReason: str | None = None
     visualReadinessMs: int | None = None
@@ -162,6 +186,7 @@ class PseudoMultiPointRoundResult(BaseModel):
     sceneProbeStartFramePath: str | None = None
     sceneProbeEndFramePath: str | None = None
     representativeFramePath: str | None = None
+    roiToleranceSelectedFramePath: str | None = None
     debugImagePath: str | None = None
     visualReadinessStartFramePath: str | None = None
     visualReadinessReadyFramePath: str | None = None
@@ -173,6 +198,7 @@ class PseudoMultiPointRoundResult(BaseModel):
     sampleQualityAcceptedMiddleFramePath: str | None = None
     sampleQualityAcceptedEndFramePath: str | None = None
     representativeFrameTargetPath: str | None = None
+    roiToleranceSelectedFrameTargetPath: str | None = None
     debugImageTargetPath: str | None = None
     visualReadinessStartFrameTargetPath: str | None = None
     visualReadinessReadyFrameTargetPath: str | None = None
@@ -212,11 +238,14 @@ class PseudoMultiPointSummary(BaseModel):
     transitionPresetTimeoutSeconds: float
     transitionSettleMs: int
     roundTimeoutSeconds: float
+    roundTimeoutPolicy: RoundTimeoutPolicy = "warn_only"
     timeoutSemantics: str
     averageRoundElapsedMs: float | None = None
     minRoundElapsedMs: int | None = None
     maxRoundElapsedMs: int | None = None
     matchedExpectedRounds: int = 0
+    timingSloExceededRounds: int = 0
+    strictTimeoutFailedRounds: int = 0
     visualReadinessFailedRounds: int = 0
     visualBlurryBeforeDetectionRounds: int = 0
     visualNotReadyTimeoutRounds: int = 0
@@ -241,6 +270,7 @@ class PseudoMultiPointRuntimeConfig:
     transitionPresetTimeoutSeconds: float
     roundTimeoutSeconds: float
     outputRoot: Path
+    roundTimeoutPolicy: RoundTimeoutPolicy = "warn_only"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -284,6 +314,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=25.0,
         help="Soft timeout marker for a whole round. Does not forcibly cancel the inner recognition chain.",
+    )
+    parser.add_argument(
+        "--round-timeout-policy",
+        choices=("warn_only", "fail"),
+        default="warn_only",
+        help="warn_only preserves correct recognition with a timing warning; fail enforces the round timeout.",
     )
     parser.add_argument(
         "--output-root",
@@ -501,19 +537,25 @@ class PseudoMultiPointRunner:
     ) -> PseudoMultiPointRoundResult:
         round_elapsed_ms = _elapsed_ms(round_started_perf)
         round_timed_out = round_elapsed_ms > int(round(self.runtime_config.roundTimeoutSeconds * 1000))
+        timing_slo_exceeded = round_timed_out
+        timing_slo_reason = (
+            (
+                f"Round exceeded timing SLO {self.runtime_config.roundTimeoutSeconds:.2f}s "
+                f"(elapsed {round_elapsed_ms} ms)."
+            )
+            if round_timed_out
+            else None
+        )
+        strict_timeout_failed = False
         if round_timed_out and status == "success":
-            status = "failed"
+            if self.runtime_config.roundTimeoutPolicy == "fail":
+                status = "failed"
+                strict_timeout_failed = True
+                failure_step = "round_timeout"
+                failure_reason = timing_slo_reason
+        elif round_timed_out and failure_step is None and self.runtime_config.roundTimeoutPolicy == "fail":
             failure_step = "round_timeout"
-            failure_reason = (
-                f"Round exceeded soft timeout {self.runtime_config.roundTimeoutSeconds:.2f}s "
-                f"(elapsed {round_elapsed_ms} ms)."
-            )
-        elif round_timed_out and failure_step is None:
-            failure_step = "round_timeout"
-            failure_reason = (
-                f"Round exceeded soft timeout {self.runtime_config.roundTimeoutSeconds:.2f}s "
-                f"(elapsed {round_elapsed_ms} ms)."
-            )
+            failure_reason = timing_slo_reason
 
         recognition_execution_result = recognition_result.executionResult if recognition_result is not None else None
         recognition_effective_scene_mode = recognition_result.effectiveSceneMode if recognition_result is not None else None
@@ -599,6 +641,34 @@ class PseudoMultiPointRunner:
         score_gap_fill_ratio_mean = (
             recognition_result.scoreSummary.gapFillRatio if recognition_result is not None else None
         )
+        roi_tolerance_enabled = recognition_result.roiToleranceEnabled if recognition_result is not None else None
+        roi_tolerance_candidate_count = (
+            recognition_result.roiToleranceCandidateCount if recognition_result is not None else None
+        )
+        roi_tolerance_evaluated_candidate_count = (
+            recognition_result.roiToleranceEvaluatedCandidateCount if recognition_result is not None else None
+        )
+        roi_tolerance_selected_roi = (
+            recognition_result.roiToleranceSelectedRoi.model_dump()
+            if recognition_result is not None and recognition_result.roiToleranceSelectedRoi is not None
+            else None
+        )
+        roi_tolerance_selected_offset_x_ratio = (
+            recognition_result.roiToleranceSelectedOffsetXRatio if recognition_result is not None else None
+        )
+        roi_tolerance_selected_offset_y_ratio = (
+            recognition_result.roiToleranceSelectedOffsetYRatio if recognition_result is not None else None
+        )
+        roi_tolerance_selected_scale = (
+            recognition_result.roiToleranceSelectedScale if recognition_result is not None else None
+        )
+        roi_tolerance_base_frame_pass_count = (
+            recognition_result.roiToleranceBaseFramePassCount if recognition_result is not None else None
+        )
+        roi_tolerance_selected_frame_pass_count = (
+            recognition_result.roiToleranceSelectedFramePassCount if recognition_result is not None else None
+        )
+        roi_tolerance_rescued = recognition_result.roiToleranceRescued if recognition_result is not None else None
         twilight_profile_applied = recognition_result.twilightProfileApplied if recognition_result is not None else None
         twilight_profile_reason = recognition_result.twilightProfileReason if recognition_result is not None else None
         twilight_brightness_mean = recognition_result.twilightBrightnessMean if recognition_result is not None else None
@@ -629,6 +699,27 @@ class PseudoMultiPointRunner:
             if recognition_result is not None and recognition_result.streamStartupFreshness is not None
             else None
         )
+        stream_startup_read_failure_reason = (
+            recognition_result.streamStartupFreshness.streamReadFailureReason
+            if recognition_result is not None and recognition_result.streamStartupFreshness is not None
+            else None
+        )
+        stream_startup_read_failure_count = (
+            recognition_result.streamStartupFreshness.streamReadFailureCount
+            if recognition_result is not None and recognition_result.streamStartupFreshness is not None
+            else None
+        )
+        stream_startup_read_call_elapsed_ms = (
+            recognition_result.streamStartupFreshness.streamReadCallElapsedMs
+            if recognition_result is not None and recognition_result.streamStartupFreshness is not None
+            else None
+        )
+        pre_readiness_session_reopened = recognition_result.preReadinessSessionReopened if recognition_result else None
+        pre_readiness_stream_recovered = recognition_result.preReadinessStreamRecovered if recognition_result else None
+        pre_readiness_stream_retry_count = recognition_result.preReadinessStreamRetryCount if recognition_result else None
+        stream_read_failure_reason = recognition_result.streamReadFailureReason if recognition_result else None
+        stream_read_failure_count = recognition_result.streamReadFailureCount if recognition_result else None
+        stream_read_call_elapsed_ms = recognition_result.streamReadCallElapsedMs if recognition_result else None
         visual_readiness_passed = recognition_result.visualReadinessPassed if recognition_result is not None else None
         visual_readiness_reason = recognition_result.visualReadinessReason if recognition_result is not None else None
         visual_readiness_ms = recognition_result.timing.visualReadinessMs if recognition_result is not None else None
@@ -939,6 +1030,9 @@ class PseudoMultiPointRunner:
         representative_frame_target_path = (
             recognition_result.evidencePaths.representativeFramePath if recognition_result is not None else None
         )
+        roi_tolerance_selected_frame_target_path = (
+            recognition_result.evidencePaths.roiToleranceSelectedFramePath if recognition_result is not None else None
+        )
         debug_image_target_path = recognition_result.evidencePaths.debugImagePath if recognition_result is not None else None
         visual_readiness_start_frame_target_path = (
             recognition_result.evidencePaths.visualReadinessStartFramePath if recognition_result is not None else None
@@ -990,6 +1084,9 @@ class PseudoMultiPointRunner:
         scene_probe_start_frame_path = scene_probe_start_frame_target_path if replay_evidence_ready else None
         scene_probe_end_frame_path = scene_probe_end_frame_target_path if replay_evidence_ready else None
         representative_frame_path = representative_frame_target_path if replay_evidence_ready else None
+        roi_tolerance_selected_frame_path = (
+            roi_tolerance_selected_frame_target_path if replay_evidence_ready else None
+        )
         debug_image_path = debug_image_target_path if replay_evidence_ready else None
         visual_readiness_start_frame_path = (
             visual_readiness_start_frame_target_path if replay_evidence_ready else None
@@ -1030,6 +1127,10 @@ class PseudoMultiPointRunner:
             roundElapsedMs=round_elapsed_ms,
             roundTimedOut=round_timed_out,
             roundTimeoutSeconds=self.runtime_config.roundTimeoutSeconds,
+            roundTimeoutPolicy=self.runtime_config.roundTimeoutPolicy,
+            timingSloExceeded=timing_slo_exceeded,
+            timingSloReason=timing_slo_reason,
+            strictTimeoutFailed=strict_timeout_failed,
             transitionSettleMsConfigured=self.runtime_config.transitionSettleMs,
             transitionSettleWaitMsActual=transition_settle_wait_ms_actual,
             transitionPreset=transition_result,
@@ -1057,6 +1158,16 @@ class PseudoMultiPointRunner:
             scoreGapFillPassCount=score_gap_fill_pass_count,
             scoreHardGateMinGapFillRatioConfigured=score_hard_gate_min_gap_fill_ratio_configured,
             scoreGapFillRatioMean=score_gap_fill_ratio_mean,
+            roiToleranceEnabled=roi_tolerance_enabled,
+            roiToleranceCandidateCount=roi_tolerance_candidate_count,
+            roiToleranceEvaluatedCandidateCount=roi_tolerance_evaluated_candidate_count,
+            roiToleranceSelectedRoi=roi_tolerance_selected_roi,
+            roiToleranceSelectedOffsetXRatio=roi_tolerance_selected_offset_x_ratio,
+            roiToleranceSelectedOffsetYRatio=roi_tolerance_selected_offset_y_ratio,
+            roiToleranceSelectedScale=roi_tolerance_selected_scale,
+            roiToleranceBaseFramePassCount=roi_tolerance_base_frame_pass_count,
+            roiToleranceSelectedFramePassCount=roi_tolerance_selected_frame_pass_count,
+            roiToleranceRescued=roi_tolerance_rescued,
             twilightProfileApplied=twilight_profile_applied,
             twilightProfileReason=twilight_profile_reason,
             twilightBrightnessMean=twilight_brightness_mean,
@@ -1067,6 +1178,15 @@ class PseudoMultiPointRunner:
             streamStartupFreshnessElapsedMs=stream_startup_freshness_elapsed_ms,
             streamStartupFreshnessJumpDetected=stream_startup_freshness_jump_detected,
             streamStartupFreshnessStableAfterJump=stream_startup_freshness_stable_after_jump,
+            streamStartupReadFailureReason=stream_startup_read_failure_reason,
+            streamStartupReadFailureCount=stream_startup_read_failure_count,
+            streamStartupReadCallElapsedMs=stream_startup_read_call_elapsed_ms,
+            preReadinessSessionReopened=pre_readiness_session_reopened,
+            preReadinessStreamRecovered=pre_readiness_stream_recovered,
+            preReadinessStreamRetryCount=pre_readiness_stream_retry_count,
+            streamReadFailureReason=stream_read_failure_reason,
+            streamReadFailureCount=stream_read_failure_count,
+            streamReadCallElapsedMs=stream_read_call_elapsed_ms,
             visualReadinessPassed=visual_readiness_passed,
             visualReadinessReason=visual_readiness_reason,
             visualReadinessMs=visual_readiness_ms,
@@ -1141,6 +1261,7 @@ class PseudoMultiPointRunner:
             sceneProbeStartFramePath=scene_probe_start_frame_path,
             sceneProbeEndFramePath=scene_probe_end_frame_path,
             representativeFramePath=representative_frame_path,
+            roiToleranceSelectedFramePath=roi_tolerance_selected_frame_path,
             debugImagePath=debug_image_path,
             visualReadinessStartFramePath=visual_readiness_start_frame_path,
             visualReadinessReadyFramePath=visual_readiness_ready_frame_path,
@@ -1158,6 +1279,7 @@ class PseudoMultiPointRunner:
             sceneProbeStartFrameTargetPath=scene_probe_start_frame_target_path,
             sceneProbeEndFrameTargetPath=scene_probe_end_frame_target_path,
             representativeFrameTargetPath=representative_frame_target_path,
+            roiToleranceSelectedFrameTargetPath=roi_tolerance_selected_frame_target_path,
             debugImageTargetPath=debug_image_target_path,
             visualReadinessStartFrameTargetPath=visual_readiness_start_frame_target_path,
             visualReadinessReadyFrameTargetPath=visual_readiness_ready_frame_target_path,
@@ -1185,6 +1307,7 @@ def build_runtime_config(args: argparse.Namespace) -> PseudoMultiPointRuntimeCon
         transitionPresetTimeoutSeconds=args.transition_timeout_seconds,
         roundTimeoutSeconds=args.round_timeout_seconds,
         outputRoot=output_root,
+        roundTimeoutPolicy=args.round_timeout_policy,
     )
 
 
@@ -1242,6 +1365,8 @@ def emit_round_progress(round_result: PseudoMultiPointRoundResult) -> None:
         f"transitionSettleMs={round_result.transitionSettleMsConfigured}",
         f"transitionSettleWaitMs={round_result.transitionSettleWaitMsActual}",
         f"roundTimedOut={round_result.roundTimedOut}",
+        f"timingSloExceeded={round_result.timingSloExceeded}",
+        f"strictTimeoutFailed={round_result.strictTimeoutFailed}",
         f"expected={round_result.expectedVisualState}",
         f"actual={round_result.actualVisualState}",
         f"matched={round_result.expectedVisualStateMatched}",
@@ -1262,6 +1387,15 @@ def emit_round_progress(round_result: PseudoMultiPointRoundResult) -> None:
         parts.append(f"failureStep={round_result.failureStep}")
     if round_result.failureReason:
         parts.append(f"reason={round_result.failureReason}")
+    if round_result.timingSloExceeded:
+        if round_result.status == "success":
+            parts.append("timingOutcome=recognized_but_over_slo")
+        elif round_result.strictTimeoutFailed:
+            parts.append("timingOutcome=strict_timeout_failed")
+        else:
+            parts.append("timingOutcome=over_slo_with_recognition_failure")
+        if round_result.timingSloReason:
+            parts.append(f"timingSloReason={round_result.timingSloReason}")
     print(" ".join(parts), file=sys.stderr)
 
 
@@ -1278,6 +1412,7 @@ def build_summary(
     rounds: list[PseudoMultiPointRoundResult],
     message: str | None,
 ) -> PseudoMultiPointSummary:
+    round_timeout_policy: RoundTimeoutPolicy = getattr(runtime_config, "roundTimeoutPolicy", "warn_only")
     round_elapsed_values = [item.roundElapsedMs for item in rounds]
     failure_breakdown = Counter(item.failureStep for item in rounds if item.failureStep)
     execution_breakdown = Counter(item.recognitionExecutionResult for item in rounds if item.recognitionExecutionResult)
@@ -1297,6 +1432,8 @@ def build_summary(
     static_bright_interference_suppressed_rounds = sum(
         1 for item in rounds if item.staticBrightInterferenceSuppressed is True
     )
+    timing_slo_exceeded_rounds = sum(1 for item in rounds if item.timingSloExceeded)
+    strict_timeout_failed_rounds = sum(1 for item in rounds if item.strictTimeoutFailed)
     return PseudoMultiPointSummary(
         runStatus=run_status,
         runId=run_id,
@@ -1317,13 +1454,18 @@ def build_summary(
         transitionPresetTimeoutSeconds=runtime_config.transitionPresetTimeoutSeconds,
         transitionSettleMs=runtime_config.transitionSettleMs,
         roundTimeoutSeconds=runtime_config.roundTimeoutSeconds,
-        timeoutSemantics="soft_observation_only_no_forced_cancellation",
+        roundTimeoutPolicy=round_timeout_policy,
+        timeoutSemantics=(
+            "soft_observation_warn_only" if round_timeout_policy == "warn_only" else "strict_timeout_failure"
+        ),
         averageRoundElapsedMs=(
             round(sum(round_elapsed_values) / len(round_elapsed_values), 2) if round_elapsed_values else None
         ),
         minRoundElapsedMs=min(round_elapsed_values) if round_elapsed_values else None,
         maxRoundElapsedMs=max(round_elapsed_values) if round_elapsed_values else None,
         matchedExpectedRounds=matched_expected_rounds,
+        timingSloExceededRounds=timing_slo_exceeded_rounds,
+        strictTimeoutFailedRounds=strict_timeout_failed_rounds,
         visualReadinessFailedRounds=visual_readiness_failed_rounds,
         visualBlurryBeforeDetectionRounds=visual_blurry_before_detection_rounds,
         visualNotReadyTimeoutRounds=visual_not_ready_timeout_rounds,

@@ -34,6 +34,7 @@ class FlvStreamSession:
     lastReadFailureReason: Literal["stream_read_timeout", "stream_eof", "stream_read_failed"] | None = None
     lastReadFailureCount: int = 0
     lastReadFailureElapsedMs: int = 0
+    lastReadCallElapsedMs: int = 0
 
     def read_frame_until(self, deadline: float) -> tuple[np.ndarray, float] | None:
         self._clear_last_read_failure()
@@ -47,13 +48,21 @@ class FlvStreamSession:
                 return None
 
             try:
+                read_started_at = monotonic()
                 success, frame = self.capture.read()
+                now = monotonic()
+                self.lastReadCallElapsedMs = max(0, int(round((now - read_started_at) * 1000)))
             except Exception as error:
                 now = monotonic()
+                self.lastReadCallElapsedMs = max(0, int(round((now - read_started_at) * 1000)))
                 consecutive_failures += 1
                 first_failure_at = first_failure_at or now
                 failure_elapsed_ms = self._failure_elapsed_ms(first_failure_at, now)
-                failure_reason = self._classify_capture_exception(error)
+                failure_reason = (
+                    "stream_read_timeout"
+                    if self.readTimeoutMs > 0 and self.lastReadCallElapsedMs >= self.readTimeoutMs
+                    else self._classify_capture_exception(error)
+                )
                 self._mark_read_failure(failure_reason, consecutive_failures, failure_elapsed_ms)
                 logger.warning(
                     "FLV session read raised %s for %s after %s failures elapsedMs=%s",
@@ -64,7 +73,15 @@ class FlvStreamSession:
                 )
                 return None
 
-            now = monotonic()
+            if self.readTimeoutMs > 0 and self.lastReadCallElapsedMs >= self.readTimeoutMs:
+                self._mark_read_failure("stream_read_timeout", 1, self.lastReadCallElapsedMs)
+                logger.warning(
+                    "FLV session read exceeded configured timeout for %s callElapsedMs=%s timeoutMs=%s",
+                    self.streamUrl,
+                    self.lastReadCallElapsedMs,
+                    self.readTimeoutMs,
+                )
+                return None
             if success and frame is not None:
                 self._clear_last_read_failure()
                 return frame, now
@@ -128,6 +145,7 @@ class FlvStreamSession:
         self.lastReadFailureReason = None
         self.lastReadFailureCount = 0
         self.lastReadFailureElapsedMs = 0
+        self.lastReadCallElapsedMs = 0
 
     @staticmethod
     def _failure_elapsed_ms(first_failure_at: float | None, now: float) -> int:
@@ -183,14 +201,9 @@ class FlvSequenceSampler:
             raise FlvSamplerError(f"OpenCV runtime dependency is unavailable: {error}") from error
 
         stream = stream_service.get_flv_stream(device_id, channel_id)
-        capture = cv2.VideoCapture(stream.streamUrl)
-        self._configure_capture_timeouts(capture, cv2)
+        capture = self._open_capture_with_timeouts(cv2, stream.streamUrl)
         if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
             capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-        open_deadline = monotonic() + self.global_config.streamOpenTimeoutMs / 1000
-        while not capture.isOpened() and monotonic() < open_deadline:
-            sleep(0.05)
 
         if not capture.isOpened():
             capture.release()
@@ -203,18 +216,41 @@ class FlvSequenceSampler:
             readTimeoutMs=self.global_config.frameReadTimeoutMs,
         )
 
-    def _configure_capture_timeouts(self, capture: Any, cv2: Any) -> None:
-        timeout_props = (
-            ("CAP_PROP_OPEN_TIMEOUT_MSEC", self.global_config.streamOpenTimeoutMs),
-            ("CAP_PROP_READ_TIMEOUT_MSEC", self.global_config.frameReadTimeoutMs),
-        )
-        for prop_name, timeout_ms in timeout_props:
-            if not hasattr(cv2, prop_name):
-                continue
-            try:
-                capture.set(getattr(cv2, prop_name), float(timeout_ms))
-            except Exception:
-                logger.debug("OpenCV capture timeout property %s is unavailable for %s", prop_name, capture)
+    def _open_capture_with_timeouts(self, cv2: Any, stream_url: str) -> Any:
+        required_properties = ("CAP_FFMPEG", "CAP_PROP_OPEN_TIMEOUT_MSEC", "CAP_PROP_READ_TIMEOUT_MSEC")
+        missing_properties = [name for name in required_properties if not hasattr(cv2, name)]
+        if missing_properties:
+            raise FlvSamplerError(
+                "OpenCV backend does not support parameterized FFmpeg stream timeouts: "
+                f"missing {', '.join(missing_properties)}"
+            )
+
+        try:
+            capture = cv2.VideoCapture()
+        except Exception as error:
+            raise FlvSamplerError(f"Failed to create OpenCV VideoCapture for FFmpeg stream: {error}") from error
+
+        parameters = [
+            int(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC),
+            int(self.global_config.streamOpenTimeoutMs),
+            int(cv2.CAP_PROP_READ_TIMEOUT_MSEC),
+            int(self.global_config.frameReadTimeoutMs),
+        ]
+        try:
+            opened = capture.open(stream_url, int(cv2.CAP_FFMPEG), parameters)
+        except Exception as error:
+            capture.release()
+            raise FlvSamplerError(
+                "OpenCV FFmpeg parameterized stream open is unavailable; refusing an unbounded fallback: "
+                f"{error}"
+            ) from error
+        if not opened:
+            capture.release()
+            raise FlvSamplerError(
+                "OpenCV FFmpeg parameterized stream open failed "
+                f"within configured timeout {self.global_config.streamOpenTimeoutMs} ms"
+            )
+        return capture
 
     def sample(self, *, device_id: str, channel_id: str) -> SampledSequence:
         with self.open_session(device_id=device_id, channel_id=channel_id) as session:

@@ -19,11 +19,6 @@ interface StreamPreviewProps {
   visualStableGraceThreshold: number;
   visualEvaluationWindowSize: number;
   visualRequiredStableCount: number;
-  rawMotionScore: number | null;
-  smoothedMotionScore: number | null;
-  stableCount: number;
-  graceCount: number;
-  failCount: number;
   onPlayerEvent: (message: string, level?: "info" | "error") => void;
   onPlaybackStateChange: (state: StreamPlaybackState) => void;
   onStreamRefreshNeeded: (reason: string) => void;
@@ -50,11 +45,6 @@ export function StreamPreview({
   visualStableGraceThreshold,
   visualEvaluationWindowSize,
   visualRequiredStableCount,
-  rawMotionScore,
-  smoothedMotionScore,
-  stableCount,
-  graceCount,
-  failCount,
   onPlayerEvent,
   onPlaybackStateChange,
   onStreamRefreshNeeded,
@@ -140,37 +130,29 @@ export function StreamPreview({
   return (
     <section className="panel previewPanel">
       <div className="panelHeader">
-        <h2>Step 4 Preview and ROI</h2>
-        <span className="metaText">{streamType ? `${streamType.toUpperCase()} stream` : "disconnected"}</span>
+        <h2>视频预览</h2>
+        <span className="metaText">{streamType ? `${streamType.toUpperCase()} 流` : "未连接"}</span>
       </div>
       <div className="videoFrame">
         {resolvedStreamUrl ? (
           <video ref={videoRef} muted playsInline autoPlay preload="auto" className="videoElement" />
         ) : (
-          <div className="emptyState">Connect device and load preview stream first.</div>
+          <div className="emptyState">请先连接设备并加载视频。</div>
         )}
       </div>
       <div className="buttonRow">
         <button type="button" className="ghostButton" disabled={!resolvedStreamUrl} onClick={handleReconnectPreview}>
-          Reconnect Preview
+          重连视频
         </button>
         <button type="button" disabled={!resolvedStreamUrl || captureDisabled} onClick={handleFreezeFrame}>
-          Freeze Current Frame
+          冻结当前画面
         </button>
       </div>
       <div className="previewStatusRow">
         <span className="statusBadge">{captureStatusLabel}</span>
-        <span className="metaText">player: {playbackState}</span>
+        <span className="metaText">播放器：{playbackState}</span>
       </div>
-      <div className="previewStatusRow">
-        <span className="metaText">raw motion: {rawMotionScore === null ? "-" : rawMotionScore.toFixed(2)}</span>
-        <span className="metaText">smoothed: {smoothedMotionScore === null ? "-" : smoothedMotionScore.toFixed(2)}</span>
-      </div>
-      <div className="previewStatusRow">
-        <span className="metaText">stable/grace/fail: {stableCount}/{graceCount}/{failCount}</span>
-        <span className="metaText">stability mode: full frame</span>
-      </div>
-      {frozenFrame ? <div className="snapshotHint">Frozen frame ready. Draw ROI below.</div> : null}
+      {frozenFrame ? <div className="snapshotHint">冻结画面已准备好，请继续标定双 ROI。</div> : null}
     </section>
   );
 }

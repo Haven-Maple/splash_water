@@ -20,10 +20,10 @@ export function PresetPanel(props: PresetPanelProps) {
   return (
     <section className="panel">
       <div className="panelHeader">
-        <h2>Step 3 · Preset Management</h2>
+        <h2>预置点</h2>
       </div>
       <label>
-        <span>Preset Index</span>
+        <span>预置点编号</span>
         <input
           value={presetIndex ?? ""}
           onChange={(event) => onPresetIndexChange(event.target.value)}
@@ -32,25 +32,25 @@ export function PresetPanel(props: PresetPanelProps) {
         />
       </label>
       <label>
-        <span>Preset Name</span>
-        <input value={presetName} onChange={(event) => onPresetNameChange(event.target.value)} placeholder="Aerator Preset" />
+        <span>预置点名称</span>
+        <input value={presetName} onChange={(event) => onPresetNameChange(event.target.value)} placeholder="增氧机预置点" />
       </label>
       <div className="buttonRow singleColumnOnTight">
         <button type="button" disabled={disabled} onClick={onRefresh}>
-          Query Presets
+          刷新预置点
         </button>
         <button type="button" disabled={disabled || presetIndex === null || !presetName} onClick={onSave}>
-          Save Current View As Preset
+          保存当前位置为预置点
         </button>
         <button type="button" disabled={disabled || presetIndex === null} onClick={onTurn}>
-          Turn To Preset
+          转到预置点
         </button>
       </div>
       <div className="presetList">
-        {presets.length === 0 ? <div className="emptySmall">No preset records loaded.</div> : null}
+        {presets.length === 0 ? <div className="emptySmall">尚未加载预置点。</div> : null}
         {presets.map((preset) => (
           <button key={`${preset.presetIndex}-${preset.presetName ?? "preset"}`} type="button" className="presetItem" onClick={() => onPickPreset(preset)}>
-            <strong>Index {preset.presetIndex}</strong>
+            <strong>预置点 {preset.presetIndex}</strong>
             <span>{preset.presetName ?? ""}</span>
           </button>
         ))}
@@ -58,4 +58,3 @@ export function PresetPanel(props: PresetPanelProps) {
     </section>
   );
 }
-
