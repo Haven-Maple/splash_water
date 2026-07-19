@@ -23,11 +23,20 @@ class DahuaStreamService:
     flv_endpoint = "/open-api/api-iot/device/queryDeviceFlvLive"
     hls_endpoint = "/open-api/api-iot/device/getHlsLiveList"
 
-    def get_flv_stream(self, device_id: str, channel_id: str) -> StreamResponse:
+    def get_flv_stream(
+        self,
+        device_id: str,
+        channel_id: str,
+        *,
+        timeout: float | tuple[float, float] | None = None,
+        deadline: float | None = None,
+    ) -> StreamResponse:
         payload = client.post_open_api(
             path=self.flv_endpoint,
             body={"deviceId": device_id, "channelId": channel_id},
             local_endpoint="/api/stream/flv",
+            timeout=timeout,
+            deadline=deadline,
         )
         url = self._extract_stream_url(payload.get("data", payload), preferred="flv")
         return StreamResponse(streamType="flv", streamUrl=url, fallbackAvailable=True, raw=payload.get("data", payload))
@@ -79,4 +88,3 @@ class DahuaStreamService:
 
 
 stream_service = DahuaStreamService()
-

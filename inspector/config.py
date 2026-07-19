@@ -34,6 +34,9 @@ class RecognitionGlobalConfig(BaseModel):
     streamCatchupMs: int = Field(default=1000, ge=0)
     streamOpenTimeoutMs: int = Field(default=6000, ge=500)
     frameReadTimeoutMs: int = Field(default=3000, ge=500)
+    streamRecoveryMaxReopens: int = Field(default=2, ge=0, le=6)
+    streamRecoveryBaseBackoffMs: int = Field(default=500, ge=0, le=5000)
+    streamRecoveryBudgetMs: int = Field(default=10000, ge=1000, le=60000)
     streamStartupFreshnessEnabled: bool = True
     streamStartupFreshnessTimeoutMs: int = Field(default=800, ge=0, le=5000)
     streamStartupFreshnessJumpThreshold: float = Field(default=0.08, ge=0, le=1)

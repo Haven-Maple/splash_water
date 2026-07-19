@@ -19,7 +19,7 @@ from inspector.config import (
     load_recognition_config,
     load_recognition_raw_config,
 )
-from inspector.flv_sampler import FlvSamplerError, FlvSequenceSampler
+from inspector.flv_sampler import FlvSamplerError, FlvSequenceSampler, StreamRecoveryBudget
 from inspector.frame_alignment import FullFrameAligner
 from inspector.frame_features import FrameFeatureExtractor, mean_roi_motion
 from inspector.frame_scoring import WeightedFrameScorer
@@ -308,6 +308,7 @@ class RunOnceService:
         stream_read_failure_reason: str | None = None
         stream_read_failure_count = 0
         stream_read_call_elapsed_ms = 0
+        stream_recovery_budget = StreamRecoveryBudget.from_config(self.global_config)
 
         try:
             session = self.sampler.open_session(device_id=record.deviceId, channel_id=record.channelId)
@@ -337,21 +338,34 @@ class RunOnceService:
             )
 
         try:
-            stream_startup_freshness_result = self._guard_stream_startup_freshness(session)
-            stream_startup_freshness = self._stream_startup_freshness_metrics(stream_startup_freshness_result)
-            stream_read_failure_reason = self._stream_read_failure_reason(session)
-            stream_read_failure_count = self._stream_read_failure_count(session)
-            stream_read_call_elapsed_ms = self._stream_read_call_elapsed_ms(session)
-            if stream_read_failure_reason is not None:
+            last_pre_readiness_failure_reason: str | None = None
+            last_pre_readiness_failure_count = 0
+            last_pre_readiness_read_call_elapsed_ms = 0
+            while True:
+                stream_startup_freshness_result = self._guard_stream_startup_freshness(session)
+                stream_startup_freshness = self._stream_startup_freshness_metrics(stream_startup_freshness_result)
+                if stream_startup_freshness_result.consumedFrames > 0:
+                    self._mark_stream_session_recovered(session, stream_recovery_budget)
+                stream_read_failure_reason = self._stream_read_failure_reason(session)
+                stream_read_failure_count = self._stream_read_failure_count(session)
+                stream_read_call_elapsed_ms = self._stream_read_call_elapsed_ms(session)
+                if stream_read_failure_reason is None:
+                    if last_pre_readiness_failure_reason is not None:
+                        stream_read_failure_reason = last_pre_readiness_failure_reason
+                        stream_read_failure_count = last_pre_readiness_failure_count
+                        stream_read_call_elapsed_ms = last_pre_readiness_read_call_elapsed_ms
+                    break
+
+                last_pre_readiness_failure_reason = stream_read_failure_reason
+                last_pre_readiness_failure_count = stream_read_failure_count
+                last_pre_readiness_read_call_elapsed_ms = stream_read_call_elapsed_ms
                 pre_readiness_session_reopened = True
-                pre_readiness_stream_retry_count = 1
-                reopened_session, reopen_message = self._reopen_pre_readiness_session(session, target)
-                if reopened_session is None:
+                if not stream_recovery_budget.can_reopen():
                     return self._failure_result(
                         config_path=config_path,
                         requested_preset_index=requested_preset_index,
-                        execution_result=self._stream_failure_execution_result(stream_read_failure_reason),
-                        message=reopen_message or "FLV stream failed before visual readiness.",
+                        execution_result="stream_recovery_exhausted",
+                        message="FLV stream recovery budget was exhausted during startup freshness.",
                         timing=timing,
                         started_at=started_at,
                         target=target,
@@ -360,37 +374,41 @@ class RunOnceService:
                         stream_startup_freshness=stream_startup_freshness,
                         pre_readiness_session_reopened=pre_readiness_session_reopened,
                         pre_readiness_stream_recovered=False,
-                        pre_readiness_stream_retry_count=pre_readiness_stream_retry_count,
+                        pre_readiness_stream_retry_count=stream_recovery_budget.reopenCount,
                         stream_read_failure_reason=stream_read_failure_reason,
                         stream_read_failure_count=stream_read_failure_count,
                         stream_read_call_elapsed_ms=stream_read_call_elapsed_ms,
+                        stream_recovery=stream_recovery_budget.snapshot(),
                     )
-                session = reopened_session
-                stream_startup_freshness_result = self._guard_stream_startup_freshness(session)
-                stream_startup_freshness = self._stream_startup_freshness_metrics(stream_startup_freshness_result)
-                reopened_stream_failure_reason = self._stream_read_failure_reason(session)
-                reopened_stream_failure_count = self._stream_read_failure_count(session)
-                reopened_stream_read_call_elapsed_ms = self._stream_read_call_elapsed_ms(session)
-                if reopened_stream_failure_reason is not None:
-                    return self._failure_result(
-                        config_path=config_path,
-                        requested_preset_index=requested_preset_index,
-                        execution_result=self._stream_failure_execution_result(reopened_stream_failure_reason),
-                        message="FLV stream remained unavailable after the one pre-readiness reopen.",
-                        timing=timing,
-                        started_at=started_at,
-                        target=target,
-                        snapshot_path=record.snapshotPath,
-                        snapshot_url=record.snapshotUrl,
-                        stream_startup_freshness=stream_startup_freshness,
-                        pre_readiness_session_reopened=pre_readiness_session_reopened,
-                        pre_readiness_stream_recovered=False,
-                        pre_readiness_stream_retry_count=pre_readiness_stream_retry_count,
-                        stream_read_failure_reason=reopened_stream_failure_reason,
-                        stream_read_failure_count=reopened_stream_failure_count,
-                        stream_read_call_elapsed_ms=reopened_stream_read_call_elapsed_ms,
-                    )
-                pre_readiness_stream_recovered = True
+                reopened_session, reopen_message = self._reopen_pre_readiness_session(
+                    session, target, stream_recovery_budget, stage="startup"
+                )
+                pre_readiness_stream_retry_count = stream_recovery_budget.reopenCount
+                if reopened_session is not None:
+                    session = reopened_session
+                    continue
+                if stream_recovery_budget.can_reopen():
+                    continue
+                return self._failure_result(
+                    config_path=config_path,
+                    requested_preset_index=requested_preset_index,
+                    execution_result="stream_recovery_exhausted",
+                    message=reopen_message or "FLV stream recovery budget was exhausted during startup freshness.",
+                    timing=timing,
+                    started_at=started_at,
+                    target=target,
+                    snapshot_path=record.snapshotPath,
+                    snapshot_url=record.snapshotUrl,
+                    stream_startup_freshness=stream_startup_freshness,
+                    pre_readiness_session_reopened=pre_readiness_session_reopened,
+                    pre_readiness_stream_recovered=False,
+                    pre_readiness_stream_retry_count=pre_readiness_stream_retry_count,
+                    stream_read_failure_reason=stream_read_failure_reason,
+                    stream_read_failure_count=stream_read_failure_count,
+                    stream_read_call_elapsed_ms=stream_read_call_elapsed_ms,
+                    stream_recovery=stream_recovery_budget.snapshot(),
+                )
+            pre_readiness_stream_recovered = stream_recovery_budget.reopenCount > 0
             if self.global_config.visualReadinessEnabled:
                 visual_readiness_started = perf_counter()
                 readiness_context = self._resolve_visual_readiness_context(session)
@@ -406,12 +424,12 @@ class RunOnceService:
                 stream_read_failure_count = self._stream_read_failure_count(session)
                 stream_read_call_elapsed_ms = self._stream_read_call_elapsed_ms(session)
                 if stream_read_failure_reason is not None:
-                    if pre_readiness_stream_retry_count >= 1:
+                    if not stream_recovery_budget.can_reopen():
                         return self._failure_result(
                             config_path=config_path,
                             requested_preset_index=requested_preset_index,
-                            execution_result=self._stream_failure_execution_result(stream_read_failure_reason),
-                            message="FLV stream failed during scene-mode preparation after the one pre-readiness reopen.",
+                            execution_result="stream_recovery_exhausted",
+                            message="FLV stream recovery budget was exhausted during scene-mode preparation.",
                             timing=timing,
                             started_at=started_at,
                             target=target,
@@ -425,15 +443,18 @@ class RunOnceService:
                             stream_read_failure_reason=stream_read_failure_reason,
                             stream_read_failure_count=stream_read_failure_count,
                             stream_read_call_elapsed_ms=stream_read_call_elapsed_ms,
+                            stream_recovery=stream_recovery_budget.snapshot(),
                         )
                     pre_readiness_session_reopened = True
-                    pre_readiness_stream_retry_count = 1
-                    reopened_session, reopen_message = self._reopen_pre_readiness_session(session, target)
+                    reopened_session, reopen_message = self._reopen_pre_readiness_session(
+                        session, target, stream_recovery_budget, stage="scene_mode_stability"
+                    )
+                    pre_readiness_stream_retry_count = stream_recovery_budget.reopenCount
                     if reopened_session is None:
                         return self._failure_result(
                             config_path=config_path,
                             requested_preset_index=requested_preset_index,
-                            execution_result=self._stream_failure_execution_result(stream_read_failure_reason),
+                            execution_result=self._stream_failure_execution_result(reopen_message or stream_read_failure_reason),
                             message=reopen_message or "FLV stream failed during scene-mode preparation.",
                             timing=timing,
                             started_at=started_at,
@@ -448,6 +469,7 @@ class RunOnceService:
                             stream_read_failure_reason=stream_read_failure_reason,
                             stream_read_failure_count=stream_read_failure_count,
                             stream_read_call_elapsed_ms=stream_read_call_elapsed_ms,
+                            stream_recovery=stream_recovery_budget.snapshot(),
                         )
                     session = reopened_session
                     stream_startup_freshness_result = self._guard_stream_startup_freshness(session)
@@ -469,7 +491,7 @@ class RunOnceService:
                             config_path=config_path,
                             requested_preset_index=requested_preset_index,
                             execution_result=self._stream_failure_execution_result(reopened_stream_failure_reason),
-                            message="FLV stream remained unavailable after the one pre-readiness reopen.",
+                            message="FLV stream remained unavailable after stream recovery.",
                             timing=timing,
                             started_at=started_at,
                             target=target,
@@ -483,6 +505,7 @@ class RunOnceService:
                             stream_read_failure_reason=reopened_stream_failure_reason,
                             stream_read_failure_count=reopened_stream_failure_count,
                             stream_read_call_elapsed_ms=reopened_stream_read_call_elapsed_ms,
+                            stream_recovery=stream_recovery_budget.snapshot(),
                         )
                     pre_readiness_stream_recovered = True
                 if requested_scene_mode == "auto" and (
@@ -550,12 +573,12 @@ class RunOnceService:
                 stream_read_failure_count = self._stream_read_failure_count(session)
                 stream_read_call_elapsed_ms = self._stream_read_call_elapsed_ms(session)
                 if stream_read_failure_reason is not None and not visual_readiness.ready:
-                    if pre_readiness_stream_retry_count >= 1:
+                    if not stream_recovery_budget.can_reopen():
                         return self._failure_result(
                             config_path=config_path,
                             requested_preset_index=requested_preset_index,
-                            execution_result=self._stream_failure_execution_result(stream_read_failure_reason),
-                            message="FLV stream failed during visual readiness after the one pre-readiness reopen.",
+                            execution_result="stream_recovery_exhausted",
+                            message="FLV stream recovery budget was exhausted during visual readiness.",
                             timing=timing,
                             started_at=started_at,
                             target=target,
@@ -570,15 +593,18 @@ class RunOnceService:
                             stream_read_failure_reason=stream_read_failure_reason,
                             stream_read_failure_count=stream_read_failure_count,
                             stream_read_call_elapsed_ms=stream_read_call_elapsed_ms,
+                            stream_recovery=stream_recovery_budget.snapshot(),
                         )
                     pre_readiness_session_reopened = True
-                    pre_readiness_stream_retry_count = 1
-                    reopened_session, reopen_message = self._reopen_pre_readiness_session(session, target)
+                    reopened_session, reopen_message = self._reopen_pre_readiness_session(
+                        session, target, stream_recovery_budget, stage="visual_readiness"
+                    )
+                    pre_readiness_stream_retry_count = stream_recovery_budget.reopenCount
                     if reopened_session is None:
                         return self._failure_result(
                             config_path=config_path,
                             requested_preset_index=requested_preset_index,
-                            execution_result=self._stream_failure_execution_result(stream_read_failure_reason),
+                            execution_result=self._stream_failure_execution_result(reopen_message or stream_read_failure_reason),
                             message=reopen_message or "FLV stream failed during visual readiness.",
                             timing=timing,
                             started_at=started_at,
@@ -594,6 +620,7 @@ class RunOnceService:
                             stream_read_failure_reason=stream_read_failure_reason,
                             stream_read_failure_count=stream_read_failure_count,
                             stream_read_call_elapsed_ms=stream_read_call_elapsed_ms,
+                            stream_recovery=stream_recovery_budget.snapshot(),
                         )
                     session = reopened_session
                     stream_startup_freshness_result = self._guard_stream_startup_freshness(session)
@@ -615,7 +642,7 @@ class RunOnceService:
                             config_path=config_path,
                             requested_preset_index=requested_preset_index,
                             execution_result=self._stream_failure_execution_result(reopened_stream_failure_reason),
-                            message="FLV stream remained unavailable after the one pre-readiness reopen.",
+                            message="FLV stream remained unavailable after stream recovery.",
                             timing=timing,
                             started_at=started_at,
                             target=target,
@@ -629,6 +656,7 @@ class RunOnceService:
                             stream_read_failure_reason=reopened_stream_failure_reason,
                             stream_read_failure_count=reopened_stream_failure_count,
                             stream_read_call_elapsed_ms=reopened_stream_read_call_elapsed_ms,
+                            stream_recovery=stream_recovery_budget.snapshot(),
                         )
                     if readiness_context.effectiveConfig is None:
                         return self._failure_result(
@@ -836,6 +864,7 @@ class RunOnceService:
                     target=target,
                     readiness_outcome=readiness_outcome,
                     focus_anchor_roi=focus_anchor_roi,
+                    stream_recovery_budget=stream_recovery_budget,
                 )
                 if sample_quality_guard_result.activeSession is not None:
                     session = sample_quality_guard_result.activeSession
@@ -863,6 +892,7 @@ class RunOnceService:
                         scene_mode_stability_result=scene_mode_stability_result,
                         visual_readiness=visual_readiness,
                         readiness_outcome=readiness_outcome,
+                        stream_recovery=stream_recovery_budget.snapshot(),
                     )
                     timing.sampleMs = self._elapsed_ms(sample_started)
                     return self._failure_result(
@@ -900,6 +930,7 @@ class RunOnceService:
                         twilight_profile_reason=readiness_twilight_profile_reason,
                         twilight_brightness_mean=readiness_twilight_brightness_mean,
                         effective_config=effective_sampling_config,
+                        stream_recovery=stream_recovery_budget.snapshot(),
                     )
             except FlvSamplerError as error:
                 timing.sampleMs = self._elapsed_ms(sample_started)
@@ -1174,6 +1205,7 @@ class RunOnceService:
                 "streamReadFailureReason": stream_read_failure_reason,
                 "streamReadFailureCount": stream_read_failure_count,
                 "streamReadCallElapsedMs": stream_read_call_elapsed_ms,
+                "streamRecovery": stream_recovery_budget.snapshot(),
                 "sceneModeStability": (
                     scene_mode_stability.model_dump() if scene_mode_stability is not None else None
                 ),
@@ -1390,6 +1422,7 @@ class RunOnceService:
             streamReadFailureReason=stream_read_failure_reason,
             streamReadFailureCount=stream_read_failure_count,
             streamReadCallElapsedMs=stream_read_call_elapsed_ms,
+            streamRecovery=stream_recovery_budget.snapshot(),
             roiToleranceEnabled=roi_tolerance.enabled if roi_tolerance is not None else False,
             roiToleranceCandidateCount=roi_tolerance.candidateCount if roi_tolerance is not None else 0,
             roiToleranceEvaluatedCandidateCount=(
@@ -1462,6 +1495,7 @@ class RunOnceService:
         target: RecognitionTarget,
         readiness_outcome: VisualReadinessOutcome | None,
         focus_anchor_roi: RoiModel | None = None,
+        stream_recovery_budget: StreamRecoveryBudget | None = None,
     ) -> tuple[SampledSequence | None, _SampleQualityGuardResult]:
         checker = VisualReadinessChecker(effective_config)
         if focus_anchor_roi is None:
@@ -1513,9 +1547,9 @@ class RunOnceService:
                     stream_read_failure_reason = session_failure_reason
                     stream_read_failure_count = max(stream_read_failure_count, session_failure_count)
                     latest_failure_reason = self._sample_quality_stream_failure_reason(session_failure_reason)
-                    if sample_quality_stream_retry_count < 1:
+                    if stream_recovery_budget is None or stream_recovery_budget.can_reopen():
                         logger.warning(
-                            "Sample quality stream failure %s for %s/%s; reopening FLV session once",
+                            "Sample quality stream failure %s for %s/%s; reopening FLV session within shared recovery budget",
                             session_failure_reason,
                             target.deviceId,
                             target.channelId,
@@ -1523,11 +1557,18 @@ class RunOnceService:
                         reopened_session = self._reopen_sample_quality_session(
                             session=session,
                             target=target,
+                            recovery_budget=stream_recovery_budget,
                         )
-                        sample_quality_stream_retry_count += 1
+                        sample_quality_stream_retry_count = (
+                            stream_recovery_budget.reopenCount
+                            if stream_recovery_budget is not None
+                            else sample_quality_stream_retry_count + 1
+                        )
                         sample_quality_session_reopened = True
                         if reopened_session is not None:
                             session = reopened_session
+                            seed_frames = []
+                            seed_index = 0
                             candidate_frames = []
                             candidate_capture_times = []
                             next_sample_at = None
@@ -1535,9 +1576,12 @@ class RunOnceService:
                             previous_sample_gray = None
                             restarted_during_sampling = True
                             continue
+                    if stream_recovery_budget is not None and not stream_recovery_budget.can_reopen():
+                        latest_failure_reason = "stream_recovery_exhausted"
                 break
 
             frame, captured_at = frame_result
+            self._mark_stream_session_recovered(session, stream_recovery_budget)
             if next_sample_at is not None and captured_at + 0.002 < next_sample_at:
                 continue
 
@@ -1859,6 +1903,8 @@ class RunOnceService:
 
     @staticmethod
     def _sample_quality_execution_result(reason: str) -> ExecutionResult:
+        if reason == "stream_recovery_exhausted":
+            return "stream_recovery_exhausted"
         if reason == "sample_quality_recovery_budget_exhausted":
             return "sample_quality_degraded"
         return "sample_quality_timeout"
@@ -1896,6 +1942,7 @@ class RunOnceService:
             "sample_quality_stream_interrupted",
             "sample_quality_stream_read_timeout",
             "sample_quality_window_too_long",
+            "stream_recovery_exhausted",
         }:
             return latest_failure_reason
         if recovery_count > max_recoveries:
@@ -1913,23 +1960,89 @@ class RunOnceService:
         *,
         session: object,
         target: RecognitionTarget,
+        recovery_budget: StreamRecoveryBudget | None = None,
     ) -> object | None:
+        reopened, _ = self._reopen_stream_session_with_budget(
+            session=session,
+            target=target,
+            recovery_budget=recovery_budget,
+            stage="sample_quality",
+        )
+        return reopened
+
+    def _reopen_stream_session(
+        self,
+        *,
+        session: object,
+        target: RecognitionTarget,
+        recovery_budget: StreamRecoveryBudget | None,
+        stage: str,
+    ) -> tuple[object | None, str | None]:
+        if recovery_budget is not None and not recovery_budget.can_reopen():
+            return None, "stream_recovery_exhausted"
+        if recovery_budget is not None:
+            recovery_budget.begin()
+        backoff_ms = recovery_budget.next_backoff_ms() if recovery_budget is not None else 0
+        if recovery_budget is not None and recovery_budget.remaining_ms() <= backoff_ms:
+            return None, "stream_recovery_exhausted"
         try:
             session.release()
         except Exception:
-            logger.debug("Ignoring FLV session release failure during sample-quality reopen", exc_info=True)
+            logger.debug("Ignoring FLV session release failure during %s reopen", stage, exc_info=True)
+        if backoff_ms > 0:
+            sleep(backoff_ms / 1000)
 
+        remaining_ms = recovery_budget.remaining_ms() if recovery_budget is not None else None
+        if remaining_ms is not None and remaining_ms <= 0:
+            return None, "stream_recovery_exhausted"
+
+        open_started_at = monotonic()
         try:
-            return self.sampler.open_session(device_id=target.deviceId, channel_id=target.channelId)
+            if remaining_ms is None:
+                reopened = self.sampler.open_session(device_id=target.deviceId, channel_id=target.channelId)
+            else:
+                reopened = self.sampler.open_session(
+                    device_id=target.deviceId,
+                    channel_id=target.channelId,
+                    recovery_timeout_ms=remaining_ms,
+                    recovery_deadline=recovery_budget.deadline(),
+                )
         except FlvSamplerError as error:
+            if recovery_budget is not None:
+                recovery_budget.record(
+                    stage=stage,
+                    backoff_ms=backoff_ms,
+                    open_elapsed_ms=max(1, int(round((monotonic() - open_started_at) * 1000))),
+                    url_changed=False,
+                    session_opened=False,
+                )
             logger.warning(
-                "Sample quality reopen failed for %s/%s: %s (%s)",
+                "FLV reopen failed during %s for %s/%s: %s (%s)",
+                stage,
                 target.deviceId,
                 target.channelId,
                 error,
                 error.reason,
             )
-            return None
+            return None, str(error)
+        previous_fingerprint = getattr(session, "streamUrlFingerprint", "")
+        new_fingerprint = getattr(reopened, "streamUrlFingerprint", "")
+        if recovery_budget is not None:
+            recovery_attempt_index = recovery_budget.record(
+                stage=stage,
+                backoff_ms=backoff_ms,
+                open_elapsed_ms=max(1, int(round((monotonic() - open_started_at) * 1000))),
+                url_changed=bool(previous_fingerprint and new_fingerprint and previous_fingerprint != new_fingerprint),
+                session_opened=True,
+            )
+            reopened.recoveryAttemptIndex = recovery_attempt_index
+            if recovery_budget.elapsed_ms() > recovery_budget.budgetMs:
+                try:
+                    reopened.release()
+                except Exception:
+                    logger.debug("Ignoring FLV session release failure after recovery budget exhaustion", exc_info=True)
+                return None, "stream_recovery_exhausted"
+        return reopened, None
 
     def _persist_scene_mode_transition_replay(
         self,
@@ -2024,6 +2137,7 @@ class RunOnceService:
         scene_mode_stability_result: SceneModeStabilityResult | None,
         visual_readiness: VisualReadinessMetrics | None,
         readiness_outcome: VisualReadinessOutcome | None,
+        stream_recovery: dict[str, object] | None = None,
     ) -> tuple[dict[str, str], ReplaySaveState]:
         if not guard_result.observedFrames:
             return {}, ReplaySaveState(status="disabled", message="No sample-quality frames captured")
@@ -2112,6 +2226,7 @@ class RunOnceService:
                 "twilightBrightnessMean": twilight_brightness_mean,
                 "sampleQualityMaxRecoveriesConfigured": effective_config.sampleQualityMaxRecoveries,
                 "sampleQualityRecoveryCountSemantics": self._sample_quality_recovery_count_semantics(),
+                "streamRecovery": stream_recovery,
             },
             readiness_key_frames=self._combined_debug_key_frames(
                 stream_startup_freshness_result=stream_startup_freshness_result,
@@ -2295,21 +2410,39 @@ class RunOnceService:
         self,
         session: object,
         target: RecognitionTarget,
+        recovery_budget: StreamRecoveryBudget,
+        *,
+        stage: str,
     ) -> tuple[object | None, str | None]:
-        try:
-            session.release()
-        except Exception:
-            logger.debug("Ignoring FLV session release failure during pre-readiness reopen", exc_info=True)
-        try:
-            reopened = self.sampler.open_session(device_id=target.deviceId, channel_id=target.channelId)
-        except FlvSamplerError as error:
-            logger.warning("Pre-readiness FLV reopen failed for %s/%s: %s", target.deviceId, target.channelId, error)
-            return None, str(error)
-        except Exception as error:
-            logger.warning("Unexpected pre-readiness FLV reopen failure for %s/%s: %s", target.deviceId, target.channelId, error)
-            return None, f"Unexpected FLV reopen error: {error}"
-        logger.info("Pre-readiness FLV session reopened for %s/%s", target.deviceId, target.channelId)
-        return reopened, None
+        return self._reopen_stream_session_with_budget(
+            session=session,
+            target=target,
+            recovery_budget=recovery_budget,
+            stage=stage,
+        )
+
+    def _reopen_stream_session_with_budget(
+        self,
+        *,
+        session: object,
+        target: RecognitionTarget,
+        recovery_budget: StreamRecoveryBudget | None,
+        stage: str,
+    ) -> tuple[object | None, str | None]:
+        """Retry only session creation while preserving the run-wide reopen budget."""
+        last_message: str | None = None
+        while recovery_budget is None or recovery_budget.can_reopen():
+            reopened, last_message = self._reopen_stream_session(
+                session=session,
+                target=target,
+                recovery_budget=recovery_budget,
+                stage=stage,
+            )
+            if reopened is not None:
+                return reopened, None
+            if recovery_budget is None:
+                return None, last_message
+        return None, "stream_recovery_exhausted"
 
     @staticmethod
     def _stream_read_failure_reason(session: object) -> str | None:
@@ -2325,7 +2458,15 @@ class RunOnceService:
         return max(0, int(getattr(session, "lastReadCallElapsedMs", 0) or 0))
 
     @staticmethod
+    def _mark_stream_session_recovered(session: object, recovery_budget: StreamRecoveryBudget | None) -> None:
+        if recovery_budget is None:
+            return
+        recovery_budget.mark_stream_recovered(getattr(session, "recoveryAttemptIndex", None))
+
+    @staticmethod
     def _stream_failure_execution_result(reason: str | None) -> ExecutionResult:
+        if reason == "stream_recovery_exhausted":
+            return "stream_recovery_exhausted"
         return "stream_read_timeout" if reason == "stream_read_timeout" else "stream_failed"
 
     def _config_for_scene_mode(self, scene_mode: ResolvedSceneMode) -> RecognitionGlobalConfig:
@@ -2994,6 +3135,7 @@ class RunOnceService:
         stream_read_failure_reason: str | None = None,
         stream_read_failure_count: int = 0,
         stream_read_call_elapsed_ms: int = 0,
+        stream_recovery: dict[str, object] | None = None,
     ) -> RecognitionRunResult:
         timing.totalMs = self._elapsed_ms(started_at)
         fallback_target = target or RecognitionTarget(
@@ -3050,6 +3192,7 @@ class RunOnceService:
             streamReadFailureReason=stream_read_failure_reason,
             streamReadFailureCount=stream_read_failure_count,
             streamReadCallElapsedMs=stream_read_call_elapsed_ms,
+            streamRecovery=stream_recovery,
             scoreSummary=self._score_summary(effective_config=effective_config),
             evidencePaths=RecognitionEvidencePaths(
                 calibrationPath=str(config_path),

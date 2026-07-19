@@ -36,3 +36,6 @@ class PresetOperationResponse(BaseModel):
     accepted: bool
     presetIndex: int
     raw: Any
+    attemptCount: int = 1
+    attempts: list[dict[str, Any]] = Field(default_factory=list)
+    unknownStateRetrySucceeded: bool = False

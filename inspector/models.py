@@ -13,6 +13,7 @@ ExecutionResult = Literal[
     "preset_failed",
     "stream_failed",
     "stream_read_timeout",
+    "stream_recovery_exhausted",
     "insufficient_frames",
     "visual_not_ready",
     "visual_not_ready_timeout",
@@ -302,6 +303,7 @@ class RecognitionRunResult(BaseModel):
     streamReadFailureReason: str | None = None
     streamReadFailureCount: int = 0
     streamReadCallElapsedMs: int = 0
+    streamRecovery: dict[str, object] | None = None
     roiToleranceEnabled: bool | None = None
     roiToleranceCandidateCount: int | None = None
     roiToleranceEvaluatedCandidateCount: int | None = None

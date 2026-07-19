@@ -37,6 +37,10 @@ class TransitionPresetStepResult(BaseModel):
     timeoutSeconds: float
     message: str | None = None
     raw: Any = None
+    attemptCount: int = 1
+    attempts: list[dict[str, Any]] = Field(default_factory=list)
+    failureCategory: str | None = None
+    unknownStateRetrySucceeded: bool = False
 
 
 class PseudoMultiPointRoundResult(BaseModel):
@@ -59,6 +63,10 @@ class PseudoMultiPointRoundResult(BaseModel):
     transitionSettleMsConfigured: int
     transitionSettleWaitMsActual: int
     transitionPreset: TransitionPresetStepResult
+    transitionPresetAttemptCount: int | None = None
+    transitionPresetAttempts: list[dict[str, Any]] = Field(default_factory=list)
+    transitionPresetFailureCategory: str | None = None
+    transitionPresetUnknownStateRetrySucceeded: bool | None = None
     recognitionExecutionResult: str | None = None
     recognitionEffectiveSceneMode: str | None = None
     recognitionEffectiveSceneProfile: str | None = None
@@ -112,6 +120,7 @@ class PseudoMultiPointRoundResult(BaseModel):
     streamReadFailureReason: str | None = None
     streamReadFailureCount: int | None = None
     streamReadCallElapsedMs: int | None = None
+    streamRecovery: dict[str, Any] | None = None
     visualReadinessPassed: bool | None = None
     visualReadinessReason: str | None = None
     visualReadinessMs: int | None = None
@@ -366,7 +375,7 @@ class PseudoMultiPointRunner:
             status: RoundStatusLiteral = "failed"
 
             if not transition_result.accepted:
-                failure_step = "transition_preset"
+                failure_step = self._transition_failure_step(transition_result.failureCategory)
                 failure_reason = transition_result.message or "Transition preset turn failed."
             elif transition_result.timedOut:
                 failure_step = "transition_timeout"
@@ -507,8 +516,12 @@ class PseudoMultiPointRunner:
                 timeoutSeconds=self.runtime_config.transitionPresetTimeoutSeconds,
                 message=message,
                 raw=response.raw,
+                attemptCount=int(getattr(response, "attemptCount", 1)),
+                attempts=list(getattr(response, "attempts", []) or []),
+                unknownStateRetrySucceeded=bool(getattr(response, "unknownStateRetrySucceeded", False)),
             )
         except Exception as error:
+            failure_category = getattr(error, "network_failure_kind", None)
             return TransitionPresetStepResult(
                 accepted=False,
                 presetIndex=self.runtime_config.transitionPresetIndex,
@@ -517,7 +530,18 @@ class PseudoMultiPointRunner:
                 timeoutSeconds=self.runtime_config.transitionPresetTimeoutSeconds,
                 message=str(error),
                 raw=None,
+                attemptCount=len(getattr(error, "attempts", []) or []) or 1,
+                attempts=list(getattr(error, "attempts", []) or []),
+                failureCategory=failure_category or "rejected",
             )
+
+    @staticmethod
+    def _transition_failure_step(failure_category: str | None) -> str:
+        if failure_category in {"connect_timeout", "read_timeout"}:
+            return "transition_preset_network_timeout"
+        if failure_category == "connection_error":
+            return "transition_preset_network_error"
+        return "transition_preset_rejected"
 
     def _finalize_round(
         self,
@@ -558,6 +582,10 @@ class PseudoMultiPointRunner:
             failure_reason = timing_slo_reason
 
         recognition_execution_result = recognition_result.executionResult if recognition_result is not None else None
+        transition_preset_attempt_count = transition_result.attemptCount
+        transition_preset_attempts = transition_result.attempts
+        transition_preset_failure_category = transition_result.failureCategory
+        transition_preset_unknown_state_retry_succeeded = transition_result.unknownStateRetrySucceeded
         recognition_effective_scene_mode = recognition_result.effectiveSceneMode if recognition_result is not None else None
         recognition_effective_scene_profile = (
             recognition_result.effectiveSceneProfile if recognition_result is not None else None
@@ -720,6 +748,7 @@ class PseudoMultiPointRunner:
         stream_read_failure_reason = recognition_result.streamReadFailureReason if recognition_result else None
         stream_read_failure_count = recognition_result.streamReadFailureCount if recognition_result else None
         stream_read_call_elapsed_ms = recognition_result.streamReadCallElapsedMs if recognition_result else None
+        stream_recovery = getattr(recognition_result, "streamRecovery", None) if recognition_result else None
         visual_readiness_passed = recognition_result.visualReadinessPassed if recognition_result is not None else None
         visual_readiness_reason = recognition_result.visualReadinessReason if recognition_result is not None else None
         visual_readiness_ms = recognition_result.timing.visualReadinessMs if recognition_result is not None else None
@@ -1134,6 +1163,10 @@ class PseudoMultiPointRunner:
             transitionSettleMsConfigured=self.runtime_config.transitionSettleMs,
             transitionSettleWaitMsActual=transition_settle_wait_ms_actual,
             transitionPreset=transition_result,
+            transitionPresetAttemptCount=transition_preset_attempt_count,
+            transitionPresetAttempts=transition_preset_attempts,
+            transitionPresetFailureCategory=transition_preset_failure_category,
+            transitionPresetUnknownStateRetrySucceeded=transition_preset_unknown_state_retry_succeeded,
             recognitionExecutionResult=recognition_execution_result,
             recognitionEffectiveSceneMode=recognition_effective_scene_mode,
             recognitionEffectiveSceneProfile=recognition_effective_scene_profile,
@@ -1187,6 +1220,7 @@ class PseudoMultiPointRunner:
             streamReadFailureReason=stream_read_failure_reason,
             streamReadFailureCount=stream_read_failure_count,
             streamReadCallElapsedMs=stream_read_call_elapsed_ms,
+            streamRecovery=stream_recovery,
             visualReadinessPassed=visual_readiness_passed,
             visualReadinessReason=visual_readiness_reason,
             visualReadinessMs=visual_readiness_ms,

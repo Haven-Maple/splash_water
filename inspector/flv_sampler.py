@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
 from time import monotonic, sleep
 from typing import Any, Literal
 
@@ -24,6 +25,90 @@ class FlvSamplerError(RuntimeError):
 
 
 @dataclass(slots=True)
+class StreamRecoveryBudget:
+    maxReopens: int
+    baseBackoffMs: int
+    budgetMs: int
+    startedAt: float | None = None
+    reopenCount: int = 0
+    attempts: list[dict[str, object]] | None = None
+
+    @classmethod
+    def from_config(cls, config: RecognitionGlobalConfig) -> "StreamRecoveryBudget":
+        return cls(
+            maxReopens=config.streamRecoveryMaxReopens,
+            baseBackoffMs=config.streamRecoveryBaseBackoffMs,
+            budgetMs=config.streamRecoveryBudgetMs,
+            startedAt=None,
+            attempts=[],
+        )
+
+    def elapsed_ms(self) -> int:
+        if self.startedAt is None:
+            return 0
+        return max(0, int(round((monotonic() - self.startedAt) * 1000)))
+
+    def begin(self) -> None:
+        if self.startedAt is None:
+            self.startedAt = monotonic()
+
+    def can_reopen(self) -> bool:
+        return self.reopenCount < self.maxReopens and self.elapsed_ms() < self.budgetMs
+
+    def remaining_ms(self) -> int:
+        return max(0, self.budgetMs - self.elapsed_ms())
+
+    def deadline(self) -> float | None:
+        return self.startedAt + self.budgetMs / 1000.0 if self.startedAt is not None else None
+
+    def next_backoff_ms(self) -> int:
+        return min(self.baseBackoffMs * (2**self.reopenCount), max(0, self.budgetMs - self.elapsed_ms()))
+
+    def record(
+        self,
+        *,
+        stage: str,
+        backoff_ms: int,
+        open_elapsed_ms: int,
+        url_changed: bool,
+        session_opened: bool,
+    ) -> int:
+        self.reopenCount += 1
+        assert self.attempts is not None
+        self.attempts.append(
+            {
+                "reopenIndex": self.reopenCount,
+                "stage": stage,
+                "backoffMs": backoff_ms,
+                "openElapsedMs": open_elapsed_ms,
+                "urlChanged": url_changed,
+                "sessionOpened": session_opened,
+                "streamRecovered": False,
+            }
+        )
+        return self.reopenCount
+
+    def mark_stream_recovered(self, reopen_index: int | None) -> None:
+        if reopen_index is None or self.attempts is None:
+            return
+        for attempt in self.attempts:
+            if attempt["reopenIndex"] == reopen_index:
+                attempt["streamRecovered"] = True
+                return
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "maxReopens": self.maxReopens,
+            "budgetMs": self.budgetMs,
+            "elapsedMs": self.elapsed_ms(),
+            "reopenCount": self.reopenCount,
+            "started": self.startedAt is not None,
+            "exhausted": not self.can_reopen(),
+            "attempts": self.attempts or [],
+        }
+
+
+@dataclass(slots=True)
 class FlvStreamSession:
     streamType: str
     streamUrl: str
@@ -35,6 +120,9 @@ class FlvStreamSession:
     lastReadFailureCount: int = 0
     lastReadFailureElapsedMs: int = 0
     lastReadCallElapsedMs: int = 0
+    openElapsedMs: int = 0
+    streamUrlFingerprint: str = ""
+    recoveryAttemptIndex: int | None = None
 
     def read_frame_until(self, deadline: float) -> tuple[np.ndarray, float] | None:
         self._clear_last_read_failure()
@@ -189,7 +277,15 @@ class FlvSequenceSampler:
     def __init__(self, global_config: RecognitionGlobalConfig) -> None:
         self.global_config = global_config
 
-    def open_session(self, *, device_id: str, channel_id: str) -> FlvStreamSession:
+    def open_session(
+        self,
+        *,
+        device_id: str,
+        channel_id: str,
+        recovery_timeout_ms: int | None = None,
+        recovery_deadline: float | None = None,
+    ) -> FlvStreamSession:
+        opened_at = monotonic()
         try:
             from app.services.dahua_stream_service import stream_service
         except Exception as error:
@@ -200,23 +296,55 @@ class FlvSequenceSampler:
         except Exception as error:
             raise FlvSamplerError(f"OpenCV runtime dependency is unavailable: {error}") from error
 
-        stream = stream_service.get_flv_stream(device_id, channel_id)
-        capture = self._open_capture_with_timeouts(cv2, stream.streamUrl)
+        if recovery_timeout_ms is not None and recovery_timeout_ms <= 0:
+            raise FlvSamplerError("FLV recovery budget expired before requesting a new stream URL")
+        if recovery_deadline is None and recovery_timeout_ms is not None:
+            recovery_deadline = opened_at + recovery_timeout_ms / 1000.0
+        url_timeout_ms = min(
+            self.global_config.streamOpenTimeoutMs,
+            recovery_timeout_ms if recovery_timeout_ms is not None else self.global_config.streamOpenTimeoutMs,
+        )
+        try:
+            if recovery_timeout_ms is None:
+                stream = stream_service.get_flv_stream(device_id, channel_id)
+            else:
+                stream = stream_service.get_flv_stream(
+                    device_id,
+                    channel_id,
+                    timeout=max(0.001, url_timeout_ms / 1000),
+                    deadline=recovery_deadline,
+                )
+        except Exception as error:
+            raise FlvSamplerError(f"Failed to obtain a fresh FLV stream URL: {error}") from error
+        if recovery_deadline is not None:
+            open_timeout_ms = max(0, int((recovery_deadline - monotonic()) * 1000))
+            if open_timeout_ms <= 0:
+                raise FlvSamplerError("FLV recovery budget expired before opening the refreshed stream")
+        else:
+            open_timeout_ms = self.global_config.streamOpenTimeoutMs
+        open_timeout_ms = min(self.global_config.streamOpenTimeoutMs, open_timeout_ms)
+        capture = self._open_capture_with_timeouts(cv2, stream.streamUrl, open_timeout_ms=open_timeout_ms)
         if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
             capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
         if not capture.isOpened():
             capture.release()
-            raise FlvSamplerError(f"Failed to open FLV stream within {self.global_config.streamOpenTimeoutMs} ms")
+            raise FlvSamplerError(f"Failed to open FLV stream within {open_timeout_ms} ms")
 
         return FlvStreamSession(
             streamType=stream.streamType,
             streamUrl=stream.streamUrl,
             capture=capture,
             readTimeoutMs=self.global_config.frameReadTimeoutMs,
+            openElapsedMs=max(1, int(round((monotonic() - opened_at) * 1000))),
+            streamUrlFingerprint=self._url_fingerprint(stream.streamUrl),
         )
 
-    def _open_capture_with_timeouts(self, cv2: Any, stream_url: str) -> Any:
+    @staticmethod
+    def _url_fingerprint(stream_url: str) -> str:
+        return sha256(stream_url.encode("utf-8")).hexdigest()[:12]
+
+    def _open_capture_with_timeouts(self, cv2: Any, stream_url: str, *, open_timeout_ms: int | None = None) -> Any:
         required_properties = ("CAP_FFMPEG", "CAP_PROP_OPEN_TIMEOUT_MSEC", "CAP_PROP_READ_TIMEOUT_MSEC")
         missing_properties = [name for name in required_properties if not hasattr(cv2, name)]
         if missing_properties:
@@ -232,7 +360,7 @@ class FlvSequenceSampler:
 
         parameters = [
             int(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC),
-            int(self.global_config.streamOpenTimeoutMs),
+            int(open_timeout_ms if open_timeout_ms is not None else self.global_config.streamOpenTimeoutMs),
             int(cv2.CAP_PROP_READ_TIMEOUT_MSEC),
             int(self.global_config.frameReadTimeoutMs),
         ]

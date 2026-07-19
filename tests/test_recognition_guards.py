@@ -15,9 +15,10 @@ import numpy as np
 
 import inspector.flv_sampler as flv_sampler_module
 import inspector.night_ir_gap_fill_scan as gap_fill_scan_module
+import inspector.run_once_service as run_once_service_module
 from app.schemas.calibration import RoiModel
 from inspector.config import RecognitionGlobalConfig, build_recognition_config
-from inspector.flv_sampler import FlvSamplerError, FlvSequenceSampler, FlvStreamSession
+from inspector.flv_sampler import FlvSamplerError, FlvSequenceSampler, FlvStreamSession, StreamRecoveryBudget
 from inspector.frame_scoring import WeightedFrameScorer
 from inspector.models import (
     AlignedSequence,
@@ -394,6 +395,33 @@ class VisualReadinessCheckerTests(unittest.TestCase):
 
 
 class FlvStreamSessionTests(unittest.TestCase):
+    def test_shared_recovery_budget_uses_exponential_backoff_and_safe_diagnostics(self) -> None:
+        budget = StreamRecoveryBudget(
+            maxReopens=2,
+            baseBackoffMs=500,
+            budgetMs=10000,
+            startedAt=flv_sampler_module.monotonic(),
+            attempts=[],
+        )
+
+        self.assertEqual(budget.next_backoff_ms(), 500)
+        budget.record(stage="startup", backoff_ms=500, open_elapsed_ms=120, url_changed=True, session_opened=True)
+        self.assertEqual(budget.next_backoff_ms(), 1000)
+        budget.record(
+            stage="sample_quality",
+            backoff_ms=1000,
+            open_elapsed_ms=80,
+            url_changed=False,
+            session_opened=False,
+        )
+
+        snapshot = budget.snapshot()
+        self.assertEqual(snapshot["reopenCount"], 2)
+        self.assertTrue(snapshot["exhausted"])
+        self.assertEqual(snapshot["attempts"][0]["urlChanged"], True)
+        self.assertTrue(snapshot["attempts"][0]["sessionOpened"])
+        self.assertFalse(snapshot["attempts"][0]["streamRecovered"])
+        self.assertNotIn("streamUrl", snapshot["attempts"][0])
     def test_parameterized_ffmpeg_open_passes_timeout_properties_before_open(self) -> None:
         class _Capture:
             def __init__(self) -> None:
@@ -433,6 +461,79 @@ class FlvStreamSessionTests(unittest.TestCase):
 
         self.assertEqual(capture.open_calls, [("https://stream", 1900, [53, 6000, 54, 3000])])
         self.assertEqual(session.readTimeoutMs, 3000)
+
+    def test_recovery_open_caps_url_request_and_ffmpeg_open_to_remaining_budget(self) -> None:
+        class _Capture:
+            def __init__(self) -> None:
+                self.opened = False
+                self.open_calls: list[tuple[str, int, list[int]]] = []
+
+            def open(self, url: str, backend: int, parameters: list[int]) -> bool:
+                self.open_calls.append((url, backend, parameters))
+                self.opened = True
+                return True
+
+            def isOpened(self) -> bool:
+                return self.opened
+
+            def set(self, _property: int, _value: int) -> bool:
+                return True
+
+            def release(self) -> None:
+                self.opened = False
+
+        capture = _Capture()
+        cv2_module = types.SimpleNamespace(
+            CAP_FFMPEG=1900,
+            CAP_PROP_OPEN_TIMEOUT_MSEC=53,
+            CAP_PROP_READ_TIMEOUT_MSEC=54,
+            CAP_PROP_BUFFERSIZE=38,
+            VideoCapture=Mock(return_value=capture),
+        )
+        stream_module = types.ModuleType("app.services.dahua_stream_service")
+        stream_module.stream_service = types.SimpleNamespace(
+            get_flv_stream=Mock(return_value=types.SimpleNamespace(streamType="flv", streamUrl="https://stream"))
+        )
+        sampler = FlvSequenceSampler(RecognitionGlobalConfig(streamOpenTimeoutMs=6000, frameReadTimeoutMs=3000))
+
+        with patch.dict(sys.modules, {"cv2": cv2_module, "app.services.dahua_stream_service": stream_module}):
+            sampler.open_session(device_id="device", channel_id="0", recovery_timeout_ms=850)
+
+        stream_module.stream_service.get_flv_stream.assert_called_once()
+        self.assertEqual(stream_module.stream_service.get_flv_stream.call_args.args, ("device", "0"))
+        self.assertEqual(stream_module.stream_service.get_flv_stream.call_args.kwargs["timeout"], 0.85)
+        self.assertIn("deadline", stream_module.stream_service.get_flv_stream.call_args.kwargs)
+        self.assertEqual(len(capture.open_calls), 1)
+        self.assertEqual(capture.open_calls[0][0], "https://stream")
+        self.assertEqual(capture.open_calls[0][1], 1900)
+        self.assertGreater(capture.open_calls[0][2][1], 0)
+        self.assertLessEqual(capture.open_calls[0][2][1], 850)
+        self.assertEqual(capture.open_calls[0][2][2:], [54, 3000])
+
+    def test_reopen_assigns_recovery_index_to_real_slots_session(self) -> None:
+        class _Capture:
+            def release(self) -> None:
+                return None
+
+        config = RecognitionGlobalConfig(streamRecoveryBaseBackoffMs=0, streamRecoveryBudgetMs=10000)
+        service = RunOnceService(global_config=config)
+        original = FlvStreamSession(streamType="flv", streamUrl="https://old", capture=_Capture())
+        reopened = FlvStreamSession(streamType="flv", streamUrl="https://new", capture=_Capture())
+        service.sampler.open_session = Mock(return_value=reopened)
+        budget = StreamRecoveryBudget.from_config(config)
+
+        with patch.object(run_once_service_module, "sleep"):
+            session, message = service._reopen_stream_session(
+                session=original,
+                target=types.SimpleNamespace(deviceId="device", channelId="0"),
+                recovery_budget=budget,
+                stage="startup",
+            )
+
+        self.assertIs(session, reopened)
+        self.assertIsNone(message)
+        self.assertEqual(reopened.recoveryAttemptIndex, 1)
+        self.assertTrue(budget.snapshot()["attempts"][0]["sessionOpened"])
 
     def test_blocked_read_uses_real_call_elapsed_time_for_timeout_diagnosis(self) -> None:
         class _SlowCapture:
@@ -3199,6 +3300,7 @@ class RunOnceVisualReadinessTests(unittest.TestCase):
         self.assertTrue(guard_result.metrics.sampleQualityStreamRecovered)
         self.assertTrue(guard_result.metrics.sampleQualitySessionReopened)
         self.assertEqual(guard_result.metrics.sampleQualityStreamRetryCount, 1)
+        self.assertEqual(guard_result.metrics.reusedReadinessFrames, 0)
         self.assertIs(guard_result.activeSession, reopened_session)
         self.assertTrue(first_session.released)
         service.sampler.open_session.assert_called_once_with(device_id="device", channel_id="0")
@@ -3343,7 +3445,9 @@ class RunOnceVisualReadinessTests(unittest.TestCase):
                 confirmFrameIndex=0,
             )
 
-        def _fake_sample_quality_guard(*, session, effective_config, target, readiness_outcome, focus_anchor_roi):  # noqa: ANN001
+        def _fake_sample_quality_guard(
+            *, session, effective_config, target, readiness_outcome, focus_anchor_roi, stream_recovery_budget=None
+        ):  # noqa: ANN001
             self.assertEqual(effective_config.sceneMode, "night_ir")
             self.assertEqual(effective_config.sampleQualityTimeoutMs, 5700)
             self.assertEqual(effective_config.sampleQualityMaxRecoveries, 3)
@@ -3484,7 +3588,7 @@ class RunOnceVisualReadinessTests(unittest.TestCase):
         self.assertEqual(result.streamReadCallElapsedMs, 3100)
         self.assertEqual(service.sampler.open_session.call_count, 2)
 
-    def test_run_once_reports_stream_timeout_when_pre_readiness_reopen_fails(self) -> None:
+    def test_run_once_reports_recovery_exhausted_after_two_pre_readiness_reopens_fail(self) -> None:
         calibration = types.SimpleNamespace(
             deviceId="device",
             channelId="0",
@@ -3506,7 +3610,11 @@ class RunOnceVisualReadinessTests(unittest.TestCase):
         first_session.lastReadFailureCount = 1
         first_session.lastReadCallElapsedMs = 3100
         service.sampler.open_session = Mock(
-            side_effect=[first_session, FlvSamplerError("reopen unavailable", reason="stream_failed")]
+            side_effect=[
+                first_session,
+                FlvSamplerError("reopen unavailable", reason="stream_failed"),
+                FlvSamplerError("second reopen unavailable", reason="stream_failed"),
+            ]
         )
         fake_preset_module = types.ModuleType("app.services.dahua_preset_service")
         fake_preset_module.preset_service = types.SimpleNamespace(turn_preset=Mock(return_value=None))
@@ -3524,10 +3632,13 @@ class RunOnceVisualReadinessTests(unittest.TestCase):
                 ):
                     result = service.run(config_path=Path("demo.json"), requested_preset_index=1)
 
-        self.assertEqual(result.executionResult, "stream_read_timeout")
+        self.assertEqual(result.executionResult, "stream_recovery_exhausted")
         self.assertNotEqual(result.executionResult, "scene_mode_transition_timeout")
         self.assertTrue(result.preReadinessSessionReopened)
         self.assertFalse(result.preReadinessStreamRecovered)
+        self.assertEqual(result.preReadinessStreamRetryCount, 2)
+        self.assertIsNotNone(result.streamRecovery)
+        self.assertEqual(result.streamRecovery["reopenCount"], 2)
 
 
 class PseudoMultiPointSummaryTests(unittest.TestCase):

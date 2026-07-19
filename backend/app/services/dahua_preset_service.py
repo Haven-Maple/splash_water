@@ -35,12 +35,19 @@ class DahuaPresetService:
         return PresetOperationResponse(accepted=True, presetIndex=preset_index, raw=payload.get("data", payload))
 
     def turn_preset(self, device_id: str, channel_id: str, preset_index: int) -> PresetOperationResponse:
-        payload = client.post_open_api(
+        payload, diagnostics = client.post_open_api_control_with_retry(
             path=self.turn_endpoint,
             body={"deviceId": device_id, "channelId": channel_id, "index": preset_index},
             local_endpoint="/api/preset/turn",
         )
-        return PresetOperationResponse(accepted=True, presetIndex=preset_index, raw=payload.get("data", payload))
+        return PresetOperationResponse(
+            accepted=True,
+            presetIndex=preset_index,
+            raw=payload.get("data", payload),
+            attemptCount=int(diagnostics["attemptCount"]),
+            attempts=list(diagnostics["attempts"]),
+            unknownStateRetrySucceeded=bool(diagnostics["unknownStateRetrySucceeded"]),
+        )
 
     @staticmethod
     def _normalize_preset(item: Any) -> PresetItem:
